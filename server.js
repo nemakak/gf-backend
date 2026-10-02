@@ -165,6 +165,19 @@ app.post('/api/tryon', async (req, res) => {
     });
   }
 });
+// Отметка о прохождении онбординга
+app.post('/api/onboarded', async (req, res) => {
+  const { initData } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    await pool.query('UPDATE users SET onboarded = TRUE WHERE tg_id = $1', [tgUser.id]);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[onboarded]', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 // 4. INVOICE
 app.post('/api/create-invoice', async (req, res) => {
