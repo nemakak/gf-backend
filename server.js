@@ -81,13 +81,19 @@ app.post('/api/auth', async (req, res) => {
 });
 
 // ============================================================
-// 2. ПРОКСИ ДЛЯ КАРТИНОК WB (обход hotlink-блокировки)
+// 2. ПРОКСИ ДЛЯ КАРТИНОК WB
 // ============================================================
 app.get('/api/img', async (req, res) => {
   const { url } = req.query;
-  if (!url || !/^https:\/\/[a-z0-9-]+\.wbbasket\.ru\//.test(url)) {
-    return res.status(400).send('Bad url');
+  if (!url) return res.status(400).send('Bad url');
+
+  let parsed;
+  try { parsed = new URL(url); } catch { return res.status(400).send('Bad url'); }
+
+  if (!/\.wbbasket\.ru$/.test(parsed.hostname) && !/\.wbstatic\.net$/.test(parsed.hostname)) {
+    return res.status(400).send('Bad host');
   }
+
   try {
     const r = await fetch(url, {
       headers: {
@@ -109,7 +115,7 @@ app.get('/api/img', async (req, res) => {
 });
 
 // ============================================================
-// 3. SYNC-CATALOG (из Google Apps Script)
+// 3. SYNC-CATALOG
 // ============================================================
 app.post('/api/sync-catalog', async (req, res) => {
   const { items, secret } = req.body;
@@ -174,7 +180,7 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// 5. TRYON (с mock-fallback)
+// 5. TRYON
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
   const { initData, humanImg, garmentUrl, itemId } = req.body;
@@ -257,7 +263,7 @@ app.post('/api/onboarded', async (req, res) => {
 });
 
 // ============================================================
-// 7. INVOICE (1 звезда)
+// 7. INVOICE
 // ============================================================
 app.post('/api/create-invoice', async (req, res) => {
   const { tgId, productType } = req.body;
