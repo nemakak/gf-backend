@@ -26,29 +26,10 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const VTON_MODEL = 'fal-ai/flux-2-lora-gallery/virtual-tryon';
 fal.config({ credentials: process.env.FAL_KEY });
 
-// ===== ТАРИФЫ ПОДПИСОК =====
 const SUBSCRIPTIONS = {
-  sub_pro: {
-    title: 'Подписка PRО',
-    stars: 599,
-    tries: 50,
-    own: 20,
-    multi: 5,
-    stylist: 3,
-  },
-  sub_medium: {
-    title: 'Подписка MEDIUM',
-    stars: 299,
-    tries: 30,
-    own: 10,
-    stylist: 1,
-  },
-  sub_start: {
-    title: 'Подписка START',
-    stars: 65,
-    tries: 10,
-    stylist: 1,
-  },
+  sub_pro:    { title: 'Подписка PRО',    stars: 599, tries: 50 },
+  sub_medium: { title: 'Подписка MEDIUM', stars: 299, tries: 30 },
+  sub_start:  { title: 'Подписка START',  stars: 65,  tries: 10 },
 };
 
 function verifyTelegramInitData(initData) {
@@ -106,20 +87,33 @@ app.post('/api/auth', async (req, res) => {
 });
 
 // ============================================================
-// 2. ПРОКСИ ДЛЯ КАРТИНОК WB
+// 2. ПРОКСИ ДЛЯ КАРТИНОК
 // ============================================================
 app.get('/api/img', async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).send('Bad url');
+
   let parsed;
   try { parsed = new URL(url); } catch { return res.status(400).send('Bad url'); }
-  if (!/\.wbbasket\.ru$/.test(parsed.hostname)) return res.status(400).send('Bad host');
+
+  const host = parsed.hostname;
+  const okHosts = [
+    /\.wbbasket\.ru$/,
+    /\.wbstatic\.net$/,
+    /^lh3\.googleusercontent\.com$/,
+    /^drive\.google\.com$/,
+    /^drive\.usercontent\.google\.com$/,
+  ];
+  if (!okHosts.some(rx => rx.test(host))) return res.status(400).send('Bad host');
+
   try {
     const r = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36',
-        'Referer': 'https://www.wildberries.ru/',
+        'Referer': host.includes('wbbasket') || host.includes('wbstatic') ? 'https://www.wildberries.ru/' : 'https://google.com/',
+        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
       },
+      redirect: 'follow',
     });
     if (!r.ok) return res.status(404).send('Not found');
     const buf = await r.buffer();
@@ -127,6 +121,7 @@ app.get('/api/img', async (req, res) => {
     res.set('Cache-Control', 'public, max-age=604800, immutable');
     res.send(buf);
   } catch (e) {
+    console.error('[img]', e.message);
     res.status(500).send('Proxy error');
   }
 });
@@ -138,6 +133,7 @@ app.post('/api/sync-catalog', async (req, res) => {
   const { items, secret } = req.body;
   if (secret !== 'GF_ROOM_2024_SECRET') return res.status(403).json({ error: 'Forbidden' });
   if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'Empty items' });
+
   try {
     let saved = 0;
     for (const it of items) {
@@ -153,8 +149,37 @@ app.post('/api/sync-catalog', async (req, res) => {
       );
       saved++;
     }
+    console.log(`[sync] saved ${saved}`);
     res.json({ success: true, saved });
   } catch (e) {
+    console.error('[sync]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
+// 3.5. FIX-DRIVE-URLS — починить старые URL Google Drive
+// ============================================================
+app.post('/api/fix-drive-urls', async (req, res) => {
+  const { items, secret } = req.body;
+  if (secret !== 'GF_ROOM_2024_SECRET') return res.status(403).json({ error: 'Forbidden' });
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'Empty items' });
+
+  try {
+    let updated = 0;
+    for (const it of items) {
+      if (!it.wb_id || !it.image_url) continue;
+      const r = await pool.query(
+        `UPDATE products SET image_url = $1, fallback_url = $2, updated_at = NOW()
+         WHERE wb_id = $3`,
+        [it.image_url, it.fallback_url || it.image_url, it.wb_id]
+      );
+      if (r.rowCount > 0) updated++;
+    }
+    console.log(`[fix-drive] updated ${updated}`);
+    res.json({ success: true, updated });
+  } catch (e) {
+    console.error('[fix-drive]', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -179,6 +204,7 @@ app.get('/api/catalog', async (req, res) => {
     const r = await pool.query(q, params);
     res.json({ success: true, items: r.rows });
   } catch (e) {
+    console.error('[catalog]', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -190,16 +216,18 @@ app.post('/api/tryon', async (req, res) => {
   const { initData, humanImg, garmentUrl, itemId } = req.body;
   const tgUser = verifyTelegramInitData(initData);
   if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+
   const tgId = tgUser.id;
+
   try {
     const u = await pool.query('SELECT * FROM users WHERE tg_id = $1', [tgId]);
     if (!u.rows.length) return res.status(404).json({ error: 'User not found' });
     const user = u.rows[0];
+
     const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
     if (!hasUnlimited && user.balance <= 0) return res.status(402).json({ error: 'No tries left' });
-    if (!hasUnlimited) {
-      await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
-    }
+    if (!hasUnlimited) await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
+
     let resultUrl = null, isMock = false;
     try {
       const r = await fal.subscribe(VTON_MODEL, {
@@ -221,10 +249,12 @@ app.post('/api/tryon', async (req, res) => {
       resultUrl = garmentUrl;
       isMock = true;
     }
+
     await pool.query(
       `INSERT INTO tryon_history (user_id, product_id, result_url, is_mock) VALUES ($1,$2,$3,$4)`,
       [tgId, itemId ? Number(itemId) : null, resultUrl, isMock]
     );
+
     if (user.ref_by && !user.ref_rewarded && !isMock) {
       await pool.query('UPDATE users SET ref_rewarded = TRUE WHERE tg_id = $1', [tgId]);
       await pool.query('UPDATE users SET balance = balance + 3 WHERE tg_id = $1', [user.ref_by]);
@@ -233,8 +263,10 @@ app.post('/api/tryon', async (req, res) => {
         body: JSON.stringify({ chat_id: user.ref_by, text: '🎉 Ваша подруга сделала первую примерку! +3 попытки ✨' }),
       }).catch(() => {});
     }
+
     res.json({ success: true, resultUrl, isMock });
   } catch (e) {
+    console.error('[tryon]', e);
     res.json({ success: true, resultUrl: garmentUrl || '', isMock: true });
   }
 });
@@ -255,14 +287,13 @@ app.post('/api/onboarded', async (req, res) => {
 });
 
 // ============================================================
-// 7. INVOICE (pack10 + 3 подписки)
+// 7. INVOICE (pack10 + подписки)
 // ============================================================
 app.post('/api/create-invoice', async (req, res) => {
   const { tgId, productType } = req.body;
   let title = '10 примерок одежды', amount = 1;
   let payload = `pack10:${tgId}:${Date.now()}`;
 
-  // Обработка подписок
   if (SUBSCRIPTIONS[productType]) {
     const sub = SUBSCRIPTIONS[productType];
     title = sub.title;
@@ -281,8 +312,7 @@ app.post('/api/create-invoice', async (req, res) => {
       body: JSON.stringify({
         title,
         description: 'Оплата цифровых услуг в мини-приложении',
-        payload,
-        currency: 'XTR',
+        payload, currency: 'XTR',
         prices: [{ label: title, amount }],
       }),
     });
@@ -296,10 +326,11 @@ app.post('/api/create-invoice', async (req, res) => {
 });
 
 // ============================================================
-// 8. WEBHOOK (зачисление подписок)
+// 8. WEBHOOK
 // ============================================================
 app.post('/api/webhook/telegram', async (req, res) => {
   const update = req.body;
+
   if (update.pre_checkout_query) {
     await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerPreCheckoutQuery`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -320,16 +351,12 @@ app.post('/api/webhook/telegram', async (req, res) => {
           'INSERT INTO payments (charge_id, tg_id, product, stars) VALUES ($1,$2,$3,$4)',
           [chargeId, tgId, productType, pay.total_amount]
         );
-
-        // Обычные пакеты
         if (productType === 'pack10') {
           await pool.query('UPDATE users SET balance = balance + 10 WHERE tg_id = $1', [tgId]);
         } else if (productType === 'pass24h') {
           const until = new Date(Date.now() + 24 * 60 * 60 * 1000);
           await pool.query('UPDATE users SET unlimited_until = $1 WHERE tg_id = $2', [until, tgId]);
-        }
-        // Подписки
-        else if (SUBSCRIPTIONS[productType]) {
+        } else if (SUBSCRIPTIONS[productType]) {
           const sub = SUBSCRIPTIONS[productType];
           await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [sub.tries, tgId]);
         }
