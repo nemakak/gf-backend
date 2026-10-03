@@ -146,7 +146,7 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// 4. TRYON (с mock-fallback — никогда не роняем фронт)
+// 4. TRYON (с mock-fallback)
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
   const { initData, humanImg, garmentUrl, itemId } = req.body;
@@ -229,7 +229,7 @@ app.post('/api/onboarded', async (req, res) => {
 });
 
 // ============================================================
-// 6. INVOICE
+// 6. INVOICE (1 звезда)
 // ============================================================
 app.post('/api/create-invoice', async (req, res) => {
   const { tgId, productType } = req.body;
