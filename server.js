@@ -26,6 +26,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const VTON_MODEL = 'fal-ai/flux-2-lora-gallery/virtual-tryon';
 fal.config({ credentials: process.env.FAL_KEY });
 
+// ===== ПОДПИСКИ =====
 const SUBSCRIPTIONS = {
   sub_pro:    { title: 'Подписка PRО',    stars: 599, tries: 50, own: 20 },
   sub_medium: { title: 'Подписка MEDIUM', stars: 299, tries: 30, own: 10 },
@@ -44,13 +45,19 @@ function verifyTelegramInitData(initData) {
   } catch { return null; }
 }
 
+// ============================================================
+// 1. AUTH
+// ============================================================
 app.post('/api/auth', async (req, res) => {
   const { initData, refCode } = req.body;
   const tgUser = verifyTelegramInitData(initData);
   if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+
   const { id: tgId, first_name, username, photo_url } = tgUser;
+
   try {
     const existing = await pool.query('SELECT * FROM users WHERE tg_id = $1', [tgId]);
+
     if (existing.rows.length === 0) {
       let inviterId = null;
       if (refCode?.startsWith('ref_')) {
@@ -67,30 +74,39 @@ app.post('/api/auth', async (req, res) => {
       );
       return res.json({ success: true, user: ins.rows[0] });
     }
+
     const upd = await pool.query(
-      `UPDATE users SET first_name=$1, username=$2, photo_url=$3 WHERE tg_id=$4 RETURNING *`,
+      `UPDATE users SET first_name=$1, username=$2, photo_url=$3
+       WHERE tg_id=$4 RETURNING *`,
       [first_name || null, username || null, photo_url || null, tgId]
     );
     res.json({ success: true, user: upd.rows[0] });
-  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+  } catch (e) {
+    console.error('[auth]', e);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
+// ============================================================
+// 2. ПРОКСИ КАРТИНОК
+// ============================================================
 app.get('/api/img', async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).send('Bad url');
   let parsed;
   try { parsed = new URL(url); } catch { return res.status(400).send('Bad url'); }
   const host = parsed.hostname;
-  const okHosts = [/\.wbbasket\.ru$/, /\.wbstatic\.net$/, /^lh3\.googleusercontent\.com$/, /^drive\.google\.com$/, /^drive\.usercontent\.google\.com$/];
+  const okHosts = [
+    /\.wbbasket\.ru$/, /\.wbstatic\.net$/, /\.geobasket\.ru$/,
+    /^lh3\.googleusercontent\.com$/, /^drive\.google\.com$/, /^drive\.usercontent\.google\.com$/,
+  ];
   if (!okHosts.some(rx => rx.test(host))) return res.status(400).send('Bad host');
   try {
     const r = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36',
-        'Referer': (host.includes('wbbasket') || host.includes('wbstatic')) ? 'https://www.wildberries.ru/' : 'https://google.com/',
-        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        'Referer': 'https://www.wildberries.ru/',
       },
-      redirect: 'follow',
     });
     if (!r.ok) return res.status(404).send('Not found');
     const buf = await r.buffer();
@@ -100,6 +116,9 @@ app.get('/api/img', async (req, res) => {
   } catch (e) { res.status(500).send('Proxy error'); }
 });
 
+// ============================================================
+// 3. SYNC-CATALOG
+// ============================================================
 app.post('/api/sync-catalog', async (req, res) => {
   const { items, secret } = req.body;
   if (secret !== 'GF_ROOM_2024_SECRET') return res.status(403).json({ error: 'Forbidden' });
@@ -119,10 +138,14 @@ app.post('/api/sync-catalog', async (req, res) => {
       );
       saved++;
     }
+    console.log(`[sync] saved ${saved}`);
     res.json({ success: true, saved });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ============================================================
+// 3.5. FIX-DRIVE-URLS
+// ============================================================
 app.post('/api/fix-drive-urls', async (req, res) => {
   const { items, secret } = req.body;
   if (secret !== 'GF_ROOM_2024_SECRET') return res.status(403).json({ error: 'Forbidden' });
@@ -141,6 +164,9 @@ app.post('/api/fix-drive-urls', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ============================================================
+// 4. CATALOG
+// ============================================================
 app.get('/api/catalog', async (req, res) => {
   try {
     const { category, limit = 100, offset = 0 } = req.query;
@@ -156,14 +182,9 @@ app.get('/api/catalog', async (req, res) => {
       FROM products ${where}
       ORDER BY
         CASE category
-          WHEN 'dress' THEN 1
-          WHEN 'top' THEN 2
-          WHEN 'outerwear' THEN 3
-          WHEN 'suit' THEN 4
-          WHEN 'bottom' THEN 5
-          WHEN 'shoes' THEN 6
-          WHEN 'accessory' THEN 99
-          ELSE 50
+          WHEN 'dress' THEN 1 WHEN 'top' THEN 2 WHEN 'outerwear' THEN 3
+          WHEN 'suit' THEN 4 WHEN 'bottom' THEN 5 WHEN 'shoes' THEN 6
+          WHEN 'accessory' THEN 99 ELSE 50
         END,
         updated_at DESC, id DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}`;
@@ -172,6 +193,9 @@ app.get('/api/catalog', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ============================================================
+// 5. TRYON
+// ============================================================
 app.post('/api/tryon', async (req, res) => {
   const { initData, humanImg, garmentUrl, itemId, isOwnProduct, category } = req.body;
   const tgUser = verifyTelegramInitData(initData);
@@ -191,12 +215,12 @@ app.post('/api/tryon', async (req, res) => {
         await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
       }
     }
+
     let resultUrl = null, isMock = false;
     try {
-      const imageUrls = [humanImg, garmentUrl, garmentUrl];
       const r = await fal.subscribe(VTON_MODEL, {
         input: {
-          image_urls: imageUrls,
+          image_urls: [humanImg, garmentUrl, garmentUrl],
           prompt: 'TRYON a full-body photo of a person. Replace the outfit with the top and bottom as shown in the reference images. The final image is a full body shot.',
           num_inference_steps: 40,
           guidance_scale: 2.5,
@@ -210,27 +234,32 @@ app.post('/api/tryon', async (req, res) => {
       resultUrl = r?.data?.images?.[0]?.url || null;
       if (!resultUrl) throw new Error('empty fal response');
     } catch (e) {
+      console.warn('[tryon] fal failed, mock:', e.message);
       resultUrl = garmentUrl;
       isMock = true;
     }
+
     await pool.query(
       `INSERT INTO tryon_history (user_id, product_id, result_url, is_mock, category) VALUES ($1,$2,$3,$4,$5)`,
       [tgId, itemId ? Number(itemId) : null, resultUrl, isMock, category || null]
     );
+
     if (user.ref_by && !user.ref_rewarded && !isMock) {
       await pool.query('UPDATE users SET ref_rewarded = TRUE WHERE tg_id = $1', [tgId]);
       await pool.query('UPDATE users SET balance = balance + 3 WHERE tg_id = $1', [user.ref_by]);
-      fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: user.ref_by, text: '🎉 Ваша подруга сделала первую примерку! +3 попытки ✨' }),
-      }).catch(() => {});
+      sendMessage(user.ref_by, '🎉 Ваша подруга сделала первую примерку! +3 попытки ✨').catch(() => {});
     }
+
     res.json({ success: true, resultUrl, isMock });
   } catch (e) {
+    console.error('[tryon]', e);
     res.json({ success: true, resultUrl: garmentUrl || '', isMock: true });
   }
 });
 
+// ============================================================
+// 5.5. HISTORY
+// ============================================================
 app.post('/api/history', async (req, res) => {
   const { initData } = req.body;
   const tgUser = verifyTelegramInitData(initData);
@@ -242,14 +271,63 @@ app.post('/api/history', async (req, res) => {
        FROM tryon_history th
        LEFT JOIN products p ON p.id = th.product_id
        WHERE th.user_id = $1
-       ORDER BY th.created_at DESC
-       LIMIT 50`,
+       ORDER BY th.created_at DESC LIMIT 50`,
       [tgUser.id]
     );
     res.json({ success: true, items: r.rows });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ============================================================
+// 5.6. REDEEM PROMO
+// ============================================================
+app.post('/api/redeem-promo', async (req, res) => {
+  const { initData, code } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  const tgId = tgUser.id;
+  const cleanCode = String(code || '').trim().toUpperCase();
+  if (!cleanCode) return res.status(400).json({ error: 'Введите промокод' });
+
+  try {
+    const promo = await pool.query(
+      `SELECT * FROM promo_codes WHERE code = $1 AND is_active = TRUE
+         AND (expires_at IS NULL OR expires_at > NOW())`,
+      [cleanCode]
+    );
+    if (!promo.rows.length) return res.status(404).json({ error: 'Промокод не найден' });
+    const p = promo.rows[0];
+
+    if (p.used_count >= p.max_uses) {
+      return res.status(400).json({ error: 'Промокод больше не действует' });
+    }
+
+    const used = await pool.query(
+      'SELECT 1 FROM promo_uses WHERE code = $1 AND tg_id = $2',
+      [cleanCode, tgId]
+    );
+    if (used.rows.length) return res.status(400).json({ error: 'Вы уже использовали этот промокод' });
+
+    await pool.query('INSERT INTO promo_uses (code, tg_id) VALUES ($1, $2)', [cleanCode, tgId]);
+    await pool.query('UPDATE promo_codes SET used_count = used_count + 1 WHERE code = $1', [cleanCode]);
+
+    if (p.unlimited) {
+      const until = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      await pool.query('UPDATE users SET unlimited_until = $1 WHERE tg_id = $2', [until, tgId]);
+      return res.json({ success: true, tries: 0, unlimited: true });
+    } else {
+      await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [p.tries, tgId]);
+      return res.json({ success: true, tries: p.tries, unlimited: false });
+    }
+  } catch (e) {
+    console.error('[redeem-promo]', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ============================================================
+// 6. ONBOARDED
+// ============================================================
 app.post('/api/onboarded', async (req, res) => {
   const { initData } = req.body;
   const tgUser = verifyTelegramInitData(initData);
@@ -260,14 +338,16 @@ app.post('/api/onboarded', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
+// ============================================================
+// 7. INVOICE
+// ============================================================
 app.post('/api/create-invoice', async (req, res) => {
   const { tgId, productType, tries } = req.body;
   let title = '10 примерок одежды', amount = 1;
   let payload = `pack10:${tgId}:${Date.now()}`;
   if (SUBSCRIPTIONS[productType]) {
     const sub = SUBSCRIPTIONS[productType];
-    title = sub.title;
-    amount = sub.stars;
+    title = sub.title; amount = sub.stars;
     payload = `${productType}:${tgId}:${Date.now()}`;
   } else if (productType === 'custom_tries') {
     const n = Math.max(1, Math.min(500, Number(tries) || 1));
@@ -275,8 +355,7 @@ app.post('/api/create-invoice', async (req, res) => {
     title = `${n} примерок`;
     payload = `custom_tries:${tgId}:${n}:${Date.now()}`;
   } else if (productType === 'pass24h') {
-    title = 'Суточный безлимит (24 ч)';
-    amount = 250;
+    title = 'Суточный безлимит (24 ч)'; amount = 250;
     payload = `pass24h:${tgId}:${Date.now()}`;
   }
   try {
@@ -284,8 +363,7 @@ app.post('/api/create-invoice', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        title,
-        description: 'Оплата цифровых услуг в мини-приложении',
+        title, description: 'Оплата цифровых услуг в мини-приложении',
         payload, currency: 'XTR',
         prices: [{ label: title, amount }],
       }),
@@ -296,8 +374,148 @@ app.post('/api/create-invoice', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ============================================================
+// 8. HELPERS
+// ============================================================
+async function sendMessage(chatId, text) {
+  return fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
+  });
+}
+
+async function isAdmin(tgId) {
+  try {
+    const r = await pool.query('SELECT is_admin FROM users WHERE tg_id = $1', [tgId]);
+    return r.rows[0]?.is_admin === true;
+  } catch { return false; }
+}
+
+// ============================================================
+// 9. АДМИН-КОМАНДЫ В БОТЕ
+// ============================================================
+async function handleAdminCommand(msg) {
+  const chatId = msg.chat.id;
+  const text = (msg.text || '').trim();
+  const [cmd, ...args] = text.split(' ');
+
+  // /start — приветствие
+  if (cmd === '/start') {
+    await sendMessage(chatId, '✨ Добро пожаловать в Style Room!\n\nНажми кнопку ниже, чтобы открыть приложение.');
+    return;
+  }
+
+  // проверка админа
+  if (!(await isAdmin(msg.from.id))) {
+    await sendMessage(chatId, '⛔ У вас нет доступа к админ-командам.');
+    return;
+  }
+
+  // /admin или /help
+  if (cmd === '/admin' || cmd === '/help') {
+    await sendMessage(chatId,
+      `👑 <b>Админ-панель</b>\n\n` +
+      `/stats — статистика\n` +
+      `/users — последние юзеры\n` +
+      `/promo_create CODE TRIES MAX — создать промокод\n` +
+      `/promo_list — список промокодов\n` +
+      `/promo_delete CODE — деактивировать\n` +
+      `/broadcast TEXT — рассылка`
+    );
+    return;
+  }
+
+  // /promo_create CODE TRIES MAX
+  if (cmd === '/promo_create') {
+    const code = (args[0] || '').toUpperCase();
+    const tries = Number(args[1] || 2);
+    const maxUses = Number(args[2] || 100);
+    if (!code) return sendMessage(chatId, 'Использование: /promo_create CODE TRIES MAX\nПример: /promo_create START2 2 10');
+    try {
+      await pool.query(
+        `INSERT INTO promo_codes (code, tries, max_uses, is_active)
+         VALUES ($1, $2, $3, TRUE)
+         ON CONFLICT (code) DO UPDATE SET tries=$2, max_uses=$3, is_active=TRUE`,
+        [code, tries, maxUses]
+      );
+      await sendMessage(chatId, `✅ Промокод <b>${code}</b> создан: +${tries} попыток, лимит ${maxUses}`);
+    } catch (e) { await sendMessage(chatId, '❌ ' + e.message); }
+    return;
+  }
+
+  // /promo_list
+  if (cmd === '/promo_list') {
+    const r = await pool.query(
+      `SELECT code, tries, used_count, max_uses, is_active FROM promo_codes ORDER BY created_at DESC LIMIT 30`
+    );
+    if (!r.rows.length) return sendMessage(chatId, 'Промокодов нет');
+    let m = '<b>Промокоды:</b>\n';
+    for (const p of r.rows) {
+      m += `\n<code>${p.code}</code> · +${p.tries} · ${p.used_count}/${p.max_uses}${p.is_active ? '' : ' · ⛔'}`;
+    }
+    await sendMessage(chatId, m);
+    return;
+  }
+
+  // /promo_delete CODE
+  if (cmd === '/promo_delete') {
+    const code = (args[0] || '').toUpperCase();
+    if (!code) return sendMessage(chatId, 'Использование: /promo_delete CODE');
+    await pool.query('UPDATE promo_codes SET is_active = FALSE WHERE code = $1', [code]);
+    await sendMessage(chatId, `✅ Промокод ${code} деактивирован`);
+    return;
+  }
+
+  // /stats
+  if (cmd === '/stats') {
+    const users = await pool.query('SELECT COUNT(*)::int AS c FROM users');
+    const tryons = await pool.query('SELECT COUNT(*)::int AS c FROM tryon_history');
+    const payments = await pool.query('SELECT COUNT(*)::int AS c, COALESCE(SUM(stars),0)::int AS s FROM payments');
+    const today = await pool.query(`SELECT COUNT(*)::int AS c FROM users WHERE created_at > NOW() - INTERVAL '1 day'`);
+    await sendMessage(chatId,
+      `📊 <b>Статистика</b>\n\n` +
+      `👥 Всего юзеров: ${users.rows[0].c}\n` +
+      `🆕 За сутки: ${today.rows[0].c}\n` +
+      `✨ Примерок: ${tryons.rows[0].c}\n` +
+      `💳 Платежей: ${payments.rows[0].c} · ⭐ ${payments.rows[0].s}`
+    );
+    return;
+  }
+
+  // /users
+  if (cmd === '/users') {
+    const r = await pool.query(
+      `SELECT tg_id, first_name, username, balance, created_at FROM users ORDER BY created_at DESC LIMIT 15`
+    );
+    let m = '<b>Последние юзеры:</b>\n';
+    for (const u of r.rows) {
+      m += `\n${u.first_name || '—'} · @${u.username || '—'} · ✨${u.balance}`;
+    }
+    await sendMessage(chatId, m);
+    return;
+  }
+
+  // /broadcast TEXT
+  if (cmd === '/broadcast') {
+    const txt = args.join(' ');
+    if (!txt) return sendMessage(chatId, 'Использование: /broadcast TEXT');
+    const r = await pool.query('SELECT tg_id FROM users');
+    let sent = 0, fail = 0;
+    for (const u of r.rows) {
+      try { await sendMessage(u.tg_id, txt); sent++; } catch { fail++; }
+    }
+    await sendMessage(chatId, `✅ Отправлено: ${sent}, ошибок: ${fail}`);
+    return;
+  }
+}
+
+// ============================================================
+// 10. WEBHOOK
+// ============================================================
 app.post('/api/webhook/telegram', async (req, res) => {
   const update = req.body;
+
   if (update.pre_checkout_query) {
     await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerPreCheckoutQuery`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -305,6 +523,14 @@ app.post('/api/webhook/telegram', async (req, res) => {
     });
     return res.sendStatus(200);
   }
+
+  // Команды бота
+  if (update.message?.text?.startsWith('/')) {
+    try { await handleAdminCommand(update.message); } catch (e) { console.error('[admin]', e); }
+    return res.sendStatus(200);
+  }
+
+  // Успешная оплата
   if (update.message?.successful_payment) {
     const pay = update.message.successful_payment;
     const parts = (pay.invoice_payload || '').split(':');
@@ -339,6 +565,9 @@ app.post('/api/webhook/telegram', async (req, res) => {
   res.sendStatus(200);
 });
 
+// ============================================================
+// 11. HEALTH + CRON
+// ============================================================
 app.get('/', (_req, res) => res.send('GF Style Room API ✨'));
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
