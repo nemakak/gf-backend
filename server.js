@@ -26,7 +26,6 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const VTON_MODEL = 'fal-ai/flux-2-lora-gallery/virtual-tryon';
 fal.config({ credentials: process.env.FAL_KEY });
 
-// ===== ПОДПИСКИ =====
 const SUBSCRIPTIONS = {
   sub_pro:    { title: 'Подписка PRО',    stars: 599, tries: 50, own: 20 },
   sub_medium: { title: 'Подписка MEDIUM', stars: 299, tries: 30, own: 10 },
@@ -88,32 +87,21 @@ app.post('/api/auth', async (req, res) => {
 });
 
 // ============================================================
-// 2. ПРОКСИ ДЛЯ КАРТИНОК (WB + Google Drive)
+// 2. ПРОКСИ КАРТИНОК
 // ============================================================
 app.get('/api/img', async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).send('Bad url');
-
   let parsed;
   try { parsed = new URL(url); } catch { return res.status(400).send('Bad url'); }
-
   const host = parsed.hostname;
-  const okHosts = [
-    /\.wbbasket\.ru$/,
-    /\.wbstatic\.net$/,
-    /^lh3\.googleusercontent\.com$/,
-    /^drive\.google\.com$/,
-    /^drive\.usercontent\.google\.com$/,
-  ];
+  const okHosts = [/\.wbbasket\.ru$/, /\.wbstatic\.net$/, /^lh3\.googleusercontent\.com$/, /^drive\.google\.com$/, /^drive\.usercontent\.google\.com$/];
   if (!okHosts.some(rx => rx.test(host))) return res.status(400).send('Bad host');
-
   try {
     const r = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36',
-        'Referer': (host.includes('wbbasket') || host.includes('wbstatic'))
-          ? 'https://www.wildberries.ru/'
-          : 'https://google.com/',
+        'Referer': (host.includes('wbbasket') || host.includes('wbstatic')) ? 'https://www.wildberries.ru/' : 'https://google.com/',
         'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
       },
       redirect: 'follow',
@@ -123,20 +111,16 @@ app.get('/api/img', async (req, res) => {
     res.set('Content-Type', r.headers.get('content-type') || 'image/webp');
     res.set('Cache-Control', 'public, max-age=604800, immutable');
     res.send(buf);
-  } catch (e) {
-    console.error('[img]', e.message);
-    res.status(500).send('Proxy error');
-  }
+  } catch (e) { res.status(500).send('Proxy error'); }
 });
 
 // ============================================================
-// 3. SYNC-CATALOG (из Apps Script)
+// 3. SYNC-CATALOG
 // ============================================================
 app.post('/api/sync-catalog', async (req, res) => {
   const { items, secret } = req.body;
   if (secret !== 'GF_ROOM_2024_SECRET') return res.status(403).json({ error: 'Forbidden' });
   if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'Empty items' });
-
   try {
     let saved = 0;
     for (const it of items) {
@@ -152,12 +136,8 @@ app.post('/api/sync-catalog', async (req, res) => {
       );
       saved++;
     }
-    console.log(`[sync] saved ${saved}`);
     res.json({ success: true, saved });
-  } catch (e) {
-    console.error('[sync]', e);
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ============================================================
@@ -167,28 +147,22 @@ app.post('/api/fix-drive-urls', async (req, res) => {
   const { items, secret } = req.body;
   if (secret !== 'GF_ROOM_2024_SECRET') return res.status(403).json({ error: 'Forbidden' });
   if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'Empty items' });
-
   try {
     let updated = 0;
     for (const it of items) {
       if (!it.wb_id || !it.image_url) continue;
       const r = await pool.query(
-        `UPDATE products SET image_url = $1, fallback_url = $2, updated_at = NOW()
-         WHERE wb_id = $3`,
+        `UPDATE products SET image_url = $1, fallback_url = $2, updated_at = NOW() WHERE wb_id = $3`,
         [it.image_url, it.fallback_url || it.image_url, it.wb_id]
       );
       if (r.rowCount > 0) updated++;
     }
-    console.log(`[fix-drive] updated ${updated}`);
     res.json({ success: true, updated });
-  } catch (e) {
-    console.error('[fix-drive]', e);
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ============================================================
-// 4. CATALOG (аксессуары в конце)
+// 4. CATALOG
 // ============================================================
 app.get('/api/catalog', async (req, res) => {
   try {
@@ -214,19 +188,15 @@ app.get('/api/catalog', async (req, res) => {
           WHEN 'accessory' THEN 99
           ELSE 50
         END,
-        updated_at DESC,
-        id DESC
+        updated_at DESC, id DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}`;
     const r = await pool.query(q, params);
     res.json({ success: true, items: r.rows });
-  } catch (e) {
-    console.error('[catalog]', e);
-    res.status(500).json({ error: 'Server error' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 // ============================================================
-// 5. TRYON (FLUX 2 LoRA Gallery + УСИЛЕННЫЙ ПРОМПТ и параметры)
+// 5. TRYON — улучшенный промпт, цена та же
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
   const { initData, humanImg, garmentUrl, itemId, isOwnProduct } = req.body;
@@ -253,24 +223,30 @@ app.post('/api/tryon', async (req, res) => {
 
     let resultUrl = null, isMock = false;
     try {
-      // ✅ УСИЛЕННЫЙ ПРОМПТ: фокус на максимальном сохранении человека и реалистичной посадке одежды
       const r = await fal.subscribe(VTON_MODEL, {
         input: {
           image_urls: [humanImg, garmentUrl],
           prompt: [
-            'Photorealistic virtual try-on, high-fidelity, editorial quality.',
-            'CRITICAL: Maintain the person from image 1 with absolute precision —',
-            'identical face, facial features, expression, hair, skin tone, body proportions, pose, background, and lighting.',
-            'The person must remain completely unchanged.',
-            'ONLY replace their existing clothing with the garment from image 2.',
-            'The new garment must fit naturally, with realistic folds, wrinkles, shadows, and fabric drape.',
-            'Preserve the garment\'s original texture, color, pattern, and details.',
-            'Full body shot, sharp focus, natural light, ultra-detailed, 4K.'
+            'Ultra-realistic virtual try-on, editorial fashion quality.',
+            'CRITICAL RULE 1: Keep the person EXACTLY as in the first image —',
+            'face, eyes, nose, mouth, hair, skin tone, body shape, height, pose, hands, background, lighting, camera angle — all untouched.',
+            'Do NOT alter the person in any way.',
+            'CRITICAL RULE 2: Take the garment from the second image and REPLACE ONLY the corresponding clothing item the person is currently wearing.',
+            'If the garment is pants/trousers/jeans — replace ONLY the pants the person wears, keep their top/shirt/accessories.',
+            'If the garment is a shirt/top/blouse — replace ONLY the top, keep pants/skirt.',
+            'If the garment is a dress — replace the entire outfit.',
+            'If the garment is outerwear (coat/jacket) — wear it OVER the existing outfit.',
+            'If the garment is shoes — replace ONLY the shoes.',
+            'If the garment is an accessory (glasses/headband/scarf) — place it on the face/head/neck and do NOT touch other clothes.',
+            'NEVER add extra items (no ties, no belts, no bags) unless they are the garment itself.',
+            'CRITICAL RULE 3: The new garment must fit naturally — realistic folds, wrinkles, shadows, fabric drape.',
+            'Preserve the exact color, texture, pattern and details of the new garment.',
+            'Full body shot, sharp focus, natural light, 4K, high detail.'
           ].join(' '),
           num_inference_steps: 50,
-          guidance_scale: 3.5,
-          lora_scale: 1.25,          // Усилили эффект примерки (было 1.15)
-          acceleration: 'regular',   // Оптимизация для скорости и качества
+          guidance_scale: 4.5,
+          lora_scale: 1.35,
+          acceleration: 'regular',
           num_images: 1,
           output_format: 'jpeg',
         },
@@ -279,14 +255,13 @@ app.post('/api/tryon', async (req, res) => {
       resultUrl = r?.data?.images?.[0]?.url || null;
       if (!resultUrl) throw new Error('empty fal response');
     } catch (e) {
-      console.warn('[tryon] fal failed, mock used:', e.message);
       resultUrl = garmentUrl;
       isMock = true;
     }
 
     await pool.query(
-      `INSERT INTO tryon_history (user_id, product_id, result_url, is_mock) VALUES ($1,$2,$3,$4)`,
-      [tgId, itemId ? Number(itemId) : null, resultUrl, isMock]
+      `INSERT INTO tryon_history (user_id, product_id, result_url, is_mock, category) VALUES ($1,$2,$3,$4,$5)`,
+      [tgId, itemId ? Number(itemId) : null, resultUrl, isMock, req.body.category || null]
     );
 
     if (user.ref_by && !user.ref_rewarded && !isMock) {
@@ -300,8 +275,31 @@ app.post('/api/tryon', async (req, res) => {
 
     res.json({ success: true, resultUrl, isMock });
   } catch (e) {
-    console.error('[tryon]', e);
     res.json({ success: true, resultUrl: garmentUrl || '', isMock: true });
+  }
+});
+
+// ============================================================
+// 5.5. HISTORY — предыдущие примерки
+// ============================================================
+app.post('/api/history', async (req, res) => {
+  const { initData } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const r = await pool.query(
+      `SELECT th.id, th.result_url, th.is_mock, th.created_at, th.category,
+              p.name AS product_name, p.wb_id AS product_wb_id
+       FROM tryon_history th
+       LEFT JOIN products p ON p.id = th.product_id
+       WHERE th.user_id = $1
+       ORDER BY th.created_at DESC
+       LIMIT 50`,
+      [tgUser.id]
+    );
+    res.json({ success: true, items: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
@@ -315,16 +313,14 @@ app.post('/api/onboarded', async (req, res) => {
   try {
     await pool.query('UPDATE users SET onboarded = TRUE WHERE tg_id = $1', [tgUser.id]);
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 // ============================================================
-// 7. INVOICE (pack10 + подписки)
+// 7. INVOICE — подписки + покупка N попыток по 5 звёзд
 // ============================================================
 app.post('/api/create-invoice', async (req, res) => {
-  const { tgId, productType } = req.body;
+  const { tgId, productType, tries } = req.body;
   let title = '10 примерок одежды', amount = 1;
   let payload = `pack10:${tgId}:${Date.now()}`;
 
@@ -333,6 +329,11 @@ app.post('/api/create-invoice', async (req, res) => {
     title = sub.title;
     amount = sub.stars;
     payload = `${productType}:${tgId}:${Date.now()}`;
+  } else if (productType === 'custom_tries') {
+    const n = Math.max(1, Math.min(500, Number(tries) || 1));
+    amount = n * 5;
+    title = `${n} примерок`;
+    payload = `custom_tries:${tgId}:${n}:${Date.now()}`;
   } else if (productType === 'pass24h') {
     title = 'Суточный безлимит (24 ч)';
     amount = 250;
@@ -353,10 +354,7 @@ app.post('/api/create-invoice', async (req, res) => {
     const data = await r.json();
     if (!data.ok) throw new Error(data.description);
     res.json({ invoiceLink: data.result });
-  } catch (e) {
-    console.error('[invoice]', e);
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ============================================================
@@ -375,8 +373,9 @@ app.post('/api/webhook/telegram', async (req, res) => {
 
   if (update.message?.successful_payment) {
     const pay = update.message.successful_payment;
-    const [productType, tgIdRaw] = (pay.invoice_payload || '').split(':');
-    const tgId = Number(tgIdRaw);
+    const parts = (pay.invoice_payload || '').split(':');
+    const productType = parts[0];
+    const tgId = Number(parts[1]);
     const chargeId = pay.telegram_payment_charge_id;
     try {
       const dup = await pool.query('SELECT 1 FROM payments WHERE charge_id = $1', [chargeId]);
@@ -387,17 +386,16 @@ app.post('/api/webhook/telegram', async (req, res) => {
         );
         if (productType === 'pack10') {
           await pool.query('UPDATE users SET balance = balance + 10 WHERE tg_id = $1', [tgId]);
+        } else if (productType === 'custom_tries') {
+          const n = Number(parts[2]) || 1;
+          await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [n, tgId]);
         } else if (productType === 'pass24h') {
           const until = new Date(Date.now() + 24 * 60 * 60 * 1000);
           await pool.query('UPDATE users SET unlimited_until = $1 WHERE tg_id = $2', [until, tgId]);
         } else if (SUBSCRIPTIONS[productType]) {
           const sub = SUBSCRIPTIONS[productType];
           await pool.query(
-            `UPDATE users
-               SET balance = balance + $1,
-                   own_tries = own_tries + $2,
-                   sub_active = TRUE
-             WHERE tg_id = $3`,
+            `UPDATE users SET balance = balance + $1, own_tries = own_tries + $2, sub_active = TRUE WHERE tg_id = $3`,
             [sub.tries, sub.own || 0, tgId]
           );
         }
