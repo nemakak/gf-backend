@@ -23,8 +23,9 @@ app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-// ✅ ЗАМЕНА: FLUX Pro VTO (дешевле чем FASHN)
-const VTON_MODEL = 'fal-ai/flux-pro/v1/vto';
+
+// ✅ САМАЯ ДЕШЁВАЯ КОММЕРЧЕСКАЯ МОДЕЛЬ: $0.021/сек (~2-3 сек = ~$0.05)
+const VTON_MODEL = 'fal-ai/flux-2-lora-gallery/virtual-tryon';
 fal.config({ credentials: process.env.FAL_KEY });
 
 function verifyTelegramInitData(initData) {
@@ -116,7 +117,7 @@ app.get('/api/img', async (req, res) => {
 });
 
 // ============================================================
-// 3. SYNC-CATALOG (из Google Apps Script)
+// 3. SYNC-CATALOG
 // ============================================================
 app.post('/api/sync-catalog', async (req, res) => {
   const { items, secret } = req.body;
@@ -181,7 +182,7 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// 5. TRYON (обновлён на FLUX Pro VTO)
+// 5. TRYON (FLUX 2 LoRA Gallery — самая дешёвая)
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
   const { initData, humanImg, garmentUrl, itemId } = req.body;
@@ -205,16 +206,19 @@ app.post('/api/tryon', async (req, res) => {
 
     let resultUrl = null, isMock = false;
     try {
-      // ✅ FLUX VTO: другие имена полей + нужен prompt
+      // ✅ FLUX 2 LoRA Gallery: image_urls — МАССИВ, prompt — ОБЯЗАТЕЛЕН
       const r = await fal.subscribe(VTON_MODEL, {
         input: {
-          prompt: 'A natural front-facing studio shot. The garment is worn naturally.',
-          human_image_url: humanImg,
-          garment_image_url: garmentUrl,
+          image_urls: [humanImg, garmentUrl], // [person, garment] — порядок важен
+          prompt: 'A person wearing a stylish garment, virtual try-on, full body shot, natural lighting',
+          num_inference_steps: 28,
+          guidance_scale: 2.5,
+          lora_scale: 1.0,
+          num_images: 1,
         },
         logs: false,
       });
-      resultUrl = r?.data?.images?.[0]?.url || null; // ✅ FLUX возвращает images[], а не image{}
+      resultUrl = r?.data?.images?.[0]?.url || null; // ✅ Возвращает images[], а не image{}
       if (!resultUrl) throw new Error('empty fal response');
     } catch (e) {
       console.warn('[tryon] fal failed, mock used:', e.message);
