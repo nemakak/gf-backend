@@ -26,13 +26,15 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const VTON_MODEL = 'fal-ai/flux-2-lora-gallery/virtual-tryon';
 fal.config({ credentials: process.env.FAL_KEY });
 
-// ===== ПОДПИСКИ =====
 const SUBSCRIPTIONS = {
   sub_pro:    { title: 'Подписка PRО',    stars: 599, tries: 50, own: 20 },
   sub_medium: { title: 'Подписка MEDIUM', stars: 299, tries: 30, own: 10 },
   sub_start:  { title: 'Подписка START',  stars: 65,  tries: 10, own: 0  },
 };
 
+// ============================================================
+// HELPERS
+// ============================================================
 function verifyTelegramInitData(initData) {
   try {
     const p = new URLSearchParams(initData);
@@ -43,6 +45,38 @@ function verifyTelegramInitData(initData) {
     const ok = crypto.createHmac('sha256', key).update(str).digest('hex') === hash;
     return ok ? JSON.parse(p.get('user')) : null;
   } catch { return null; }
+}
+
+async function tgApi(method, payload) {
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return r.json();
+}
+
+async function sendMessage(chatId, text, keyboard = null) {
+  const payload = { chat_id: chatId, text, parse_mode: 'HTML' };
+  if (keyboard) payload.reply_markup = keyboard;
+  return tgApi('sendMessage', payload);
+}
+
+async function editMessage(chatId, messageId, text, keyboard = null) {
+  const payload = { chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML' };
+  if (keyboard) payload.reply_markup = keyboard;
+  return tgApi('editMessageText', payload);
+}
+
+async function answerCallback(callbackId, text = '') {
+  return tgApi('answerCallbackQuery', { callback_query_id: callbackId, text });
+}
+
+async function isAdmin(tgId) {
+  try {
+    const r = await pool.query('SELECT is_admin FROM users WHERE tg_id = $1', [tgId]);
+    return r.rows[0]?.is_admin === true;
+  } catch { return false; }
 }
 
 // ============================================================
@@ -88,7 +122,7 @@ app.post('/api/auth', async (req, res) => {
 });
 
 // ============================================================
-// 2. ПРОКСИ КАРТИНОК
+// 2. IMG PROXY
 // ============================================================
 app.get('/api/img', async (req, res) => {
   const { url } = req.query;
@@ -138,29 +172,7 @@ app.post('/api/sync-catalog', async (req, res) => {
       );
       saved++;
     }
-    console.log(`[sync] saved ${saved}`);
     res.json({ success: true, saved });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ============================================================
-// 3.5. FIX-DRIVE-URLS
-// ============================================================
-app.post('/api/fix-drive-urls', async (req, res) => {
-  const { items, secret } = req.body;
-  if (secret !== 'GF_ROOM_2024_SECRET') return res.status(403).json({ error: 'Forbidden' });
-  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'Empty items' });
-  try {
-    let updated = 0;
-    for (const it of items) {
-      if (!it.wb_id || !it.image_url) continue;
-      const r = await pool.query(
-        `UPDATE products SET image_url = $1, fallback_url = $2, updated_at = NOW() WHERE wb_id = $3`,
-        [it.image_url, it.fallback_url || it.image_url, it.wb_id]
-      );
-      if (r.rowCount > 0) updated++;
-    }
-    res.json({ success: true, updated });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -180,7 +192,7 @@ app.get('/api/catalog', async (req, res) => {
     const q = `
       SELECT id, wb_id, name, price, category, image_url, fallback_url
       FROM products ${where}
-      ORDER BY
+      ORDER BY is_pinned DESC NULLS LAST,
         CASE category
           WHEN 'dress' THEN 1 WHEN 'top' THEN 2 WHEN 'outerwear' THEN 3
           WHEN 'suit' THEN 4 WHEN 'bottom' THEN 5 WHEN 'shoes' THEN 6
@@ -234,7 +246,6 @@ app.post('/api/tryon', async (req, res) => {
       resultUrl = r?.data?.images?.[0]?.url || null;
       if (!resultUrl) throw new Error('empty fal response');
     } catch (e) {
-      console.warn('[tryon] fal failed, mock:', e.message);
       resultUrl = garmentUrl;
       isMock = true;
     }
@@ -258,7 +269,7 @@ app.post('/api/tryon', async (req, res) => {
 });
 
 // ============================================================
-// 5.5. HISTORY
+// 6. HISTORY
 // ============================================================
 app.post('/api/history', async (req, res) => {
   const { initData } = req.body;
@@ -279,7 +290,7 @@ app.post('/api/history', async (req, res) => {
 });
 
 // ============================================================
-// 5.6. REDEEM PROMO
+// 7. REDEEM PROMO
 // ============================================================
 app.post('/api/redeem-promo', async (req, res) => {
   const { initData, code } = req.body;
@@ -298,14 +309,9 @@ app.post('/api/redeem-promo', async (req, res) => {
     if (!promo.rows.length) return res.status(404).json({ error: 'Промокод не найден' });
     const p = promo.rows[0];
 
-    if (p.used_count >= p.max_uses) {
-      return res.status(400).json({ error: 'Промокод больше не действует' });
-    }
+    if (p.used_count >= p.max_uses) return res.status(400).json({ error: 'Промокод больше не действует' });
 
-    const used = await pool.query(
-      'SELECT 1 FROM promo_uses WHERE code = $1 AND tg_id = $2',
-      [cleanCode, tgId]
-    );
+    const used = await pool.query('SELECT 1 FROM promo_uses WHERE code = $1 AND tg_id = $2', [cleanCode, tgId]);
     if (used.rows.length) return res.status(400).json({ error: 'Вы уже использовали этот промокод' });
 
     await pool.query('INSERT INTO promo_uses (code, tg_id) VALUES ($1, $2)', [cleanCode, tgId]);
@@ -320,13 +326,12 @@ app.post('/api/redeem-promo', async (req, res) => {
       return res.json({ success: true, tries: p.tries, unlimited: false });
     }
   } catch (e) {
-    console.error('[redeem-promo]', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
 // ============================================================
-// 6. ONBOARDED
+// 8. ONBOARDED
 // ============================================================
 app.post('/api/onboarded', async (req, res) => {
   const { initData } = req.body;
@@ -339,7 +344,7 @@ app.post('/api/onboarded', async (req, res) => {
 });
 
 // ============================================================
-// 7. INVOICE
+// 9. INVOICE
 // ============================================================
 app.post('/api/create-invoice', async (req, res) => {
   const { tgId, productType, tries } = req.body;
@@ -375,147 +380,245 @@ app.post('/api/create-invoice', async (req, res) => {
 });
 
 // ============================================================
-// 8. HELPERS
+// 10. АДМИН-ПАНЕЛЬ С КНОПКАМИ
 // ============================================================
-async function sendMessage(chatId, text) {
-  return fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
-  });
+function adminKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '📊 Статистика', callback_data: 'adm_stats' }, { text: '👥 Юзеры', callback_data: 'adm_users' }],
+      [{ text: '🎁 Создать промокод', callback_data: 'adm_promo_create' }],
+      [{ text: '📋 Список промокодов', callback_data: 'adm_promo_list' }, { text: '❌ Удалить промокод', callback_data: 'adm_promo_delete' }],
+      [{ text: '📢 Рассылка', callback_data: 'adm_broadcast' }],
+    ],
+  };
 }
 
-async function isAdmin(tgId) {
-  try {
-    const r = await pool.query('SELECT is_admin FROM users WHERE tg_id = $1', [tgId]);
-    return r.rows[0]?.is_admin === true;
-  } catch { return false; }
+function promoTypesKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '+2 попытки', callback_data: 'adm_create_2' }, { text: '+5 попыток', callback_data: 'adm_create_5' }],
+      [{ text: '+10 попыток', callback_data: 'adm_create_10' }, { text: '+20 попыток', callback_data: 'adm_create_20' }],
+      [{ text: '💎 Безлимит 24ч', callback_data: 'adm_create_unlimited' }],
+      [{ text: '← Назад', callback_data: 'adm_back' }],
+    ],
+  };
 }
 
-// ============================================================
-// 9. АДМИН-КОМАНДЫ В БОТЕ
-// ============================================================
-async function handleAdminCommand(msg) {
+function randomCode(prefix = 'WELCOME') {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let suffix = '';
+  for (let i = 0; i < 5; i++) suffix += chars[Math.floor(Math.random() * chars.length)];
+  return `${prefix}-${suffix}`;
+}
+
+// Состояния для диалогов (кто ждёт ввода)
+const awaitingBroadcast = new Set();
+const awaitingPromoDelete = new Set();
+
+async function handleStart(msg) {
   const chatId = msg.chat.id;
-  const text = (msg.text || '').trim();
-  const [cmd, ...args] = text.split(' ');
-
-  // /start — приветствие
-  if (cmd === '/start') {
+  const isAdm = await isAdmin(msg.from.id);
+  if (isAdm) {
+    await sendMessage(chatId, '👑 <b>Админ-панель</b>\n\nВыбери действие:', adminKeyboard());
+  } else {
     await sendMessage(chatId, '✨ Добро пожаловать в Style Room!\n\nНажми кнопку ниже, чтобы открыть приложение.');
-    return;
   }
+}
 
-  // проверка админа
+async function handleAdminMenu(msg) {
+  const chatId = msg.chat.id;
   if (!(await isAdmin(msg.from.id))) {
-    await sendMessage(chatId, '⛔ У вас нет доступа к админ-командам.');
-    return;
+    return sendMessage(chatId, '⛔ Нет доступа.');
+  }
+  await sendMessage(chatId, '👑 <b>Админ-панель</b>\n\nВыбери действие:', adminKeyboard());
+}
+
+async function handleCallback(cb) {
+  const chatId = cb.message.chat.id;
+  const messageId = cb.message.message_id;
+  const data = cb.data;
+  const userId = cb.from.id;
+
+  if (!(await isAdmin(userId))) {
+    return answerCallback(cb.id, '⛔ Нет доступа');
   }
 
-  // /admin или /help
-  if (cmd === '/admin' || cmd === '/help') {
-    await sendMessage(chatId,
-      `👑 <b>Админ-панель</b>\n\n` +
-      `/stats — статистика\n` +
-      `/users — последние юзеры\n` +
-      `/promo_create CODE TRIES MAX — создать промокод\n` +
-      `/promo_list — список промокодов\n` +
-      `/promo_delete CODE — деактивировать\n` +
-      `/broadcast TEXT — рассылка`
-    );
-    return;
+  await answerCallback(cb.id);
+
+  // Назад в главное меню
+  if (data === 'adm_back') {
+    return editMessage(chatId, messageId, '👑 <b>Админ-панель</b>\n\nВыбери действие:', adminKeyboard());
   }
 
-  // /promo_create CODE TRIES MAX
-  if (cmd === '/promo_create') {
-    const code = (args[0] || '').toUpperCase();
-    const tries = Number(args[1] || 2);
-    const maxUses = Number(args[2] || 100);
-    if (!code) return sendMessage(chatId, 'Использование: /promo_create CODE TRIES MAX\nПример: /promo_create START2 2 10');
-    try {
-      await pool.query(
-        `INSERT INTO promo_codes (code, tries, max_uses, is_active)
-         VALUES ($1, $2, $3, TRUE)
-         ON CONFLICT (code) DO UPDATE SET tries=$2, max_uses=$3, is_active=TRUE`,
-        [code, tries, maxUses]
-      );
-      await sendMessage(chatId, `✅ Промокод <b>${code}</b> создан: +${tries} попыток, лимит ${maxUses}`);
-    } catch (e) { await sendMessage(chatId, '❌ ' + e.message); }
-    return;
-  }
-
-  // /promo_list
-  if (cmd === '/promo_list') {
-    const r = await pool.query(
-      `SELECT code, tries, used_count, max_uses, is_active FROM promo_codes ORDER BY created_at DESC LIMIT 30`
-    );
-    if (!r.rows.length) return sendMessage(chatId, 'Промокодов нет');
-    let m = '<b>Промокоды:</b>\n';
-    for (const p of r.rows) {
-      m += `\n<code>${p.code}</code> · +${p.tries} · ${p.used_count}/${p.max_uses}${p.is_active ? '' : ' · ⛔'}`;
-    }
-    await sendMessage(chatId, m);
-    return;
-  }
-
-  // /promo_delete CODE
-  if (cmd === '/promo_delete') {
-    const code = (args[0] || '').toUpperCase();
-    if (!code) return sendMessage(chatId, 'Использование: /promo_delete CODE');
-    await pool.query('UPDATE promo_codes SET is_active = FALSE WHERE code = $1', [code]);
-    await sendMessage(chatId, `✅ Промокод ${code} деактивирован`);
-    return;
-  }
-
-  // /stats
-  if (cmd === '/stats') {
+  // Статистика
+  if (data === 'adm_stats') {
     const users = await pool.query('SELECT COUNT(*)::int AS c FROM users');
     const tryons = await pool.query('SELECT COUNT(*)::int AS c FROM tryon_history');
     const payments = await pool.query('SELECT COUNT(*)::int AS c, COALESCE(SUM(stars),0)::int AS s FROM payments');
     const today = await pool.query(`SELECT COUNT(*)::int AS c FROM users WHERE created_at > NOW() - INTERVAL '1 day'`);
-    await sendMessage(chatId,
+    const text =
       `📊 <b>Статистика</b>\n\n` +
-      `👥 Всего юзеров: ${users.rows[0].c}\n` +
-      `🆕 За сутки: ${today.rows[0].c}\n` +
-      `✨ Примерок: ${tryons.rows[0].c}\n` +
-      `💳 Платежей: ${payments.rows[0].c} · ⭐ ${payments.rows[0].s}`
-    );
-    return;
+      `👥 Всего юзеров: <b>${users.rows[0].c}</b>\n` +
+      `🆕 За сутки: <b>${today.rows[0].c}</b>\n` +
+      `✨ Примерок: <b>${tryons.rows[0].c}</b>\n` +
+      `💳 Платежей: <b>${payments.rows[0].c}</b> · ⭐ <b>${payments.rows[0].s}</b>`;
+    return editMessage(chatId, messageId, text, {
+      inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]],
+    });
   }
 
-  // /users
-  if (cmd === '/users') {
+  // Юзеры
+  if (data === 'adm_users') {
     const r = await pool.query(
-      `SELECT tg_id, first_name, username, balance, created_at FROM users ORDER BY created_at DESC LIMIT 15`
+      `SELECT tg_id, first_name, username, balance FROM users ORDER BY created_at DESC LIMIT 15`
     );
-    let m = '<b>Последние юзеры:</b>\n';
+    let m = '👥 <b>Последние юзеры:</b>\n';
     for (const u of r.rows) {
-      m += `\n${u.first_name || '—'} · @${u.username || '—'} · ✨${u.balance}`;
+      m += `\n• ${u.first_name || '—'} · @${u.username || '—'} · ✨${u.balance}`;
     }
-    await sendMessage(chatId, m);
-    return;
+    return editMessage(chatId, messageId, m, {
+      inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]],
+    });
   }
 
-  // /broadcast TEXT
-  if (cmd === '/broadcast') {
-    const txt = args.join(' ');
-    if (!txt) return sendMessage(chatId, 'Использование: /broadcast TEXT');
-    const r = await pool.query('SELECT tg_id FROM users');
-    let sent = 0, fail = 0;
-    for (const u of r.rows) {
-      try { await sendMessage(u.tg_id, txt); sent++; } catch { fail++; }
+  // Меню создания промокода
+  if (data === 'adm_promo_create') {
+    return editMessage(chatId, messageId,
+      '🎁 <b>Создание промокода</b>\n\nВыбери номинал:',
+      promoTypesKeyboard()
+    );
+  }
+
+  // Создание с конкретным номиналом
+  if (data.startsWith('adm_create_')) {
+    const type = data.replace('adm_create_', '');
+    let tries = 2, unlimited = false;
+
+    if (type === 'unlimited') unlimited = true;
+    else tries = Number(type) || 2;
+
+    const code = randomCode();
+    try {
+      await pool.query(
+        `INSERT INTO promo_codes (code, tries, unlimited, max_uses, is_active)
+         VALUES ($1, $2, $3, 1000, TRUE)`,
+        [code, tries, unlimited]
+      );
+      const rewardText = unlimited ? '💎 Безлимит на 24 часа' : `🎁 +${tries} попыток`;
+      return editMessage(chatId, messageId,
+        `✅ <b>Промокод создан</b>\n\n` +
+        `🔑 Код: <code>${code}</code>\n` +
+        `${rewardText}\n` +
+        `📊 Лимит: 1000 активаций\n\n` +
+        `<i>Скопируй код — клиент вводит его в приложении</i>`,
+        {
+          inline_keyboard: [
+            [{ text: '🎁 Создать ещё', callback_data: 'adm_promo_create' }],
+            [{ text: '← Назад', callback_data: 'adm_back' }],
+          ],
+        }
+      );
+    } catch (e) {
+      return editMessage(chatId, messageId, '❌ Ошибка: ' + e.message, {
+        inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]],
+      });
     }
-    await sendMessage(chatId, `✅ Отправлено: ${sent}, ошибок: ${fail}`);
-    return;
+  }
+
+  // Список промокодов
+  if (data === 'adm_promo_list') {
+    const r = await pool.query(
+      `SELECT code, tries, unlimited, used_count, max_uses, is_active FROM promo_codes ORDER BY created_at DESC LIMIT 20`
+    );
+    if (!r.rows.length) {
+      return editMessage(chatId, messageId, '📋 Промокодов нет.', {
+        inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]],
+      });
+    }
+    let m = '📋 <b>Промокоды:</b>\n';
+    for (const p of r.rows) {
+      const reward = p.unlimited ? '💎 безлим' : `+${p.tries}`;
+      const status = p.is_active ? '' : ' · ⛔';
+      m += `\n<code>${p.code}</code> · ${reward} · ${p.used_count}/${p.max_uses}${status}`;
+    }
+    return editMessage(chatId, messageId, m, {
+      inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]],
+    });
+  }
+
+  // Удалить промокод — показываем список кнопок
+  if (data === 'adm_promo_delete') {
+    const r = await pool.query(
+      `SELECT code FROM promo_codes WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 10`
+    );
+    if (!r.rows.length) {
+      return editMessage(chatId, messageId, '❌ Активных промокодов нет.', {
+        inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]],
+      });
+    }
+    const buttons = r.rows.map(p => ([{ text: '❌ ' + p.code, callback_data: 'adm_del_' + p.code }]));
+    buttons.push([{ text: '← Назад', callback_data: 'adm_back' }]);
+    return editMessage(chatId, messageId, 'Выбери промокод для удаления:', { inline_keyboard: buttons });
+  }
+
+  // Удаление конкретного
+  if (data.startsWith('adm_del_')) {
+    const code = data.replace('adm_del_', '');
+    await pool.query('UPDATE promo_codes SET is_active = FALSE WHERE code = $1', [code]);
+    return editMessage(chatId, messageId,
+      `✅ Промокод <code>${code}</code> деактивирован`,
+      {
+        inline_keyboard: [
+          [{ text: '❌ Удалить ещё', callback_data: 'adm_promo_delete' }],
+          [{ text: '← Назад', callback_data: 'adm_back' }],
+        ],
+      }
+    );
+  }
+
+  // Рассылка — ждём текст
+  if (data === 'adm_broadcast') {
+    awaitingBroadcast.add(userId);
+    return editMessage(chatId, messageId,
+      '📢 <b>Рассылка</b>\n\nНапиши сообщение, которое отправим всем юзерам.\n\n' +
+      'Или нажми Отмена.',
+      {
+        inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_back' }]],
+      }
+    );
   }
 }
 
+async function handleBroadcastText(msg) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  if (!awaitingBroadcast.has(userId)) return false;
+
+  awaitingBroadcast.delete(userId);
+  const text = msg.text;
+
+  const r = await pool.query('SELECT tg_id FROM users');
+  let sent = 0, fail = 0;
+  for (const u of r.rows) {
+    try {
+      await sendMessage(u.tg_id, text);
+      sent++;
+      // защита от лимитов Telegram
+      if (sent % 25 === 0) await new Promise(rs => setTimeout(rs, 1000));
+    } catch { fail++; }
+  }
+
+  await sendMessage(chatId, `✅ Отправлено: <b>${sent}</b>, ошибок: <b>${fail}</b>`, adminKeyboard());
+  return true;
+}
+
 // ============================================================
-// 10. WEBHOOK
+// 11. WEBHOOK
 // ============================================================
 app.post('/api/webhook/telegram', async (req, res) => {
   const update = req.body;
 
+  // Pre-checkout
   if (update.pre_checkout_query) {
     await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerPreCheckoutQuery`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -524,13 +627,31 @@ app.post('/api/webhook/telegram', async (req, res) => {
     return res.sendStatus(200);
   }
 
-  // Команды бота
-  if (update.message?.text?.startsWith('/')) {
-    try { await handleAdminCommand(update.message); } catch (e) { console.error('[admin]', e); }
+  // Callback-кнопки
+  if (update.callback_query) {
+    try { await handleCallback(update.callback_query); } catch (e) { console.error('[cb]', e); }
     return res.sendStatus(200);
   }
 
-  // Успешная оплата
+  // Текстовые команды
+  if (update.message?.text) {
+    const text = update.message.text.trim();
+    const userId = update.message.from.id;
+
+    // Проверка на рассылку
+    if (await handleBroadcastText(update.message).catch(() => false)) {
+      return res.sendStatus(200);
+    }
+
+    // Команды
+    if (text === '/start') { await handleStart(update.message); return res.sendStatus(200); }
+    if (text === '/admin' || text === '/menu') { await handleAdminMenu(update.message); return res.sendStatus(200); }
+
+    // Всё остальное — не команда
+    return res.sendStatus(200);
+  }
+
+  // Оплата
   if (update.message?.successful_payment) {
     const pay = update.message.successful_payment;
     const parts = (pay.invoice_payload || '').split(':');
@@ -562,11 +683,12 @@ app.post('/api/webhook/telegram', async (req, res) => {
       }
     } catch (e) { console.error('[webhook]', e); }
   }
+
   res.sendStatus(200);
 });
 
 // ============================================================
-// 11. HEALTH + CRON
+// 12. HEALTH + CRON
 // ============================================================
 app.get('/', (_req, res) => res.send('GF Style Room API ✨'));
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
