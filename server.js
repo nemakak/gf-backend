@@ -23,8 +23,7 @@ app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-
-// ✅ САМАЯ ДЕШЁВАЯ КОММЕРЧЕСКАЯ МОДЕЛЬ: $0.021/сек (~2-3 сек = ~$0.05)
+// ✅ FLUX 2 LoRA Gallery: специализированная модель для примерки
 const VTON_MODEL = 'fal-ai/flux-2-lora-gallery/virtual-tryon';
 fal.config({ credentials: process.env.FAL_KEY });
 
@@ -206,15 +205,16 @@ app.post('/api/tryon', async (req, res) => {
 
     let resultUrl = null, isMock = false;
     try {
-      // ✅ FLUX 2 LoRA Gallery: image_urls — МАССИВ, prompt — ОБЯЗАТЕЛЕН
+      // ✅ FLUX 2 LoRA Gallery: image_urls — МАССИВ (человек + одежда), prompt ОБЯЗАТЕЛЕН
       const r = await fal.subscribe(VTON_MODEL, {
         input: {
           image_urls: [humanImg, garmentUrl], // [person, garment] — порядок важен
           prompt: 'A person wearing a stylish garment, virtual try-on, full body shot, natural lighting',
-          num_inference_steps: 28,
-          guidance_scale: 2.5,
-          lora_scale: 1.0,
+          num_inference_steps: 40, // по умолчанию 40, можно 1-50
+          guidance_scale: 2.5,     // по умолчанию 2.5
+          lora_scale: 1.0,         // сила эффекта примерки
           num_images: 1,
+          output_format: 'jpeg',   // быстрее чем png
         },
         logs: false,
       });
