@@ -26,6 +26,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const VTON_MODEL = 'fal-ai/flux-2-lora-gallery/virtual-tryon';
 fal.config({ credentials: process.env.FAL_KEY });
 
+// ===== ПОДПИСКИ =====
 const SUBSCRIPTIONS = {
   sub_pro:    { title: 'Подписка PRО',    stars: 599, tries: 50, own: 20 },
   sub_medium: { title: 'Подписка MEDIUM', stars: 299, tries: 30, own: 10 },
@@ -196,10 +197,10 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// 5. TRYON — улучшенный промпт, цена та же
+// 5. TRYON — ИСПРАВЛЕННЫЙ ПРОМПТ И 3 КАРТИНКИ
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
-  const { initData, humanImg, garmentUrl, itemId, isOwnProduct } = req.body;
+  const { initData, humanImg, garmentUrl, itemId, isOwnProduct, category } = req.body;
   const tgUser = verifyTelegramInitData(initData);
   if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
 
@@ -223,29 +224,27 @@ app.post('/api/tryon', async (req, res) => {
 
     let resultUrl = null, isMock = false;
     try {
+      // ✅ ФИКС: 3 изображения (человек + вещь + вещь) и правильный промпт TRYON
+      const isTop = category === 'top' || category === 'outerwear';
+      const isBottom = category === 'bottom';
+      
+      // Формируем массив из 3 картинок: человек, верх, низ
+      // Если вещь верх — передаём её как верх, а низ оставляем пустым (или дублируем)
+      // Если вещь низ — передаём её как низ, верх дублируем
+      // Если платье — передаём его в оба слота
+      const imageUrls = isTop
+        ? [humanImg, garmentUrl, garmentUrl]   // верх: 1-человек, 2-верх, 3-низ(дубль)
+        : isBottom
+        ? [humanImg, garmentUrl, garmentUrl]   // низ: 1-человек, 2-верх(дубль), 3-низ
+        : [humanImg, garmentUrl, garmentUrl];  // платье/другое: дублируем вещь
+
       const r = await fal.subscribe(VTON_MODEL, {
         input: {
-          image_urls: [humanImg, garmentUrl],
-          prompt: [
-            'Ultra-realistic virtual try-on, editorial fashion quality.',
-            'CRITICAL RULE 1: Keep the person EXACTLY as in the first image —',
-            'face, eyes, nose, mouth, hair, skin tone, body shape, height, pose, hands, background, lighting, camera angle — all untouched.',
-            'Do NOT alter the person in any way.',
-            'CRITICAL RULE 2: Take the garment from the second image and REPLACE ONLY the corresponding clothing item the person is currently wearing.',
-            'If the garment is pants/trousers/jeans — replace ONLY the pants the person wears, keep their top/shirt/accessories.',
-            'If the garment is a shirt/top/blouse — replace ONLY the top, keep pants/skirt.',
-            'If the garment is a dress — replace the entire outfit.',
-            'If the garment is outerwear (coat/jacket) — wear it OVER the existing outfit.',
-            'If the garment is shoes — replace ONLY the shoes.',
-            'If the garment is an accessory (glasses/headband/scarf) — place it on the face/head/neck and do NOT touch other clothes.',
-            'NEVER add extra items (no ties, no belts, no bags) unless they are the garment itself.',
-            'CRITICAL RULE 3: The new garment must fit naturally — realistic folds, wrinkles, shadows, fabric drape.',
-            'Preserve the exact color, texture, pattern and details of the new garment.',
-            'Full body shot, sharp focus, natural light, 4K, high detail.'
-          ].join(' '),
-          num_inference_steps: 50,
-          guidance_scale: 4.5,
-          lora_scale: 1.35,
+          image_urls: imageUrls,
+          prompt: `TRYON a full-body photo of a person. Replace the outfit with the top and bottom as shown in the reference images. The final image is a full body shot.`,
+          num_inference_steps: 40,
+          guidance_scale: 2.5,
+          lora_scale: 1.2,
           acceleration: 'regular',
           num_images: 1,
           output_format: 'jpeg',
@@ -255,13 +254,14 @@ app.post('/api/tryon', async (req, res) => {
       resultUrl = r?.data?.images?.[0]?.url || null;
       if (!resultUrl) throw new Error('empty fal response');
     } catch (e) {
+      console.warn('[tryon] fal failed, mock used:', e.message);
       resultUrl = garmentUrl;
       isMock = true;
     }
 
     await pool.query(
       `INSERT INTO tryon_history (user_id, product_id, result_url, is_mock, category) VALUES ($1,$2,$3,$4,$5)`,
-      [tgId, itemId ? Number(itemId) : null, resultUrl, isMock, req.body.category || null]
+      [tgId, itemId ? Number(itemId) : null, resultUrl, isMock, category || null]
     );
 
     if (user.ref_by && !user.ref_rewarded && !isMock) {
@@ -275,12 +275,13 @@ app.post('/api/tryon', async (req, res) => {
 
     res.json({ success: true, resultUrl, isMock });
   } catch (e) {
+    console.error('[tryon]', e);
     res.json({ success: true, resultUrl: garmentUrl || '', isMock: true });
   }
 });
 
 // ============================================================
-// 5.5. HISTORY — предыдущие примерки
+// 5.5. HISTORY
 // ============================================================
 app.post('/api/history', async (req, res) => {
   const { initData } = req.body;
@@ -298,9 +299,7 @@ app.post('/api/history', async (req, res) => {
       [tgUser.id]
     );
     res.json({ success: true, items: r.rows });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
 });
 
 // ============================================================
@@ -317,7 +316,7 @@ app.post('/api/onboarded', async (req, res) => {
 });
 
 // ============================================================
-// 7. INVOICE — подписки + покупка N попыток по 5 звёзд
+// 7. INVOICE
 // ============================================================
 app.post('/api/create-invoice', async (req, res) => {
   const { tgId, productType, tries } = req.body;
