@@ -38,7 +38,9 @@ function verifyTelegramInitData(initData) {
   } catch { return null; }
 }
 
+// ============================================================
 // 1. AUTH
+// ============================================================
 app.post('/api/auth', async (req, res) => {
   const { initData, refCode } = req.body;
   const tgUser = verifyTelegramInitData(initData);
@@ -78,7 +80,49 @@ app.post('/api/auth', async (req, res) => {
   }
 });
 
-// 2. CATALOG
+// ============================================================
+// 2. SYNC-CATALOG (из Google Apps Script)
+// ============================================================
+app.post('/api/sync-catalog', async (req, res) => {
+  const { items, secret } = req.body;
+
+  if (secret !== 'GF_ROOM_2024_SECRET') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  if (!Array.isArray(items) || !items.length) {
+    return res.status(400).json({ error: 'Empty items' });
+  }
+
+  try {
+    let saved = 0;
+    for (const it of items) {
+      if (!it.wb_id || !it.image_url || !it.category) continue;
+      await pool.query(
+        `INSERT INTO products (wb_id, name, price, category, image_url, fallback_url, is_active, source, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,TRUE,'auto',NOW())
+         ON CONFLICT (wb_id) DO UPDATE SET
+           name = EXCLUDED.name,
+           price = EXCLUDED.price,
+           category = EXCLUDED.category,
+           image_url = EXCLUDED.image_url,
+           fallback_url = EXCLUDED.fallback_url,
+           is_active = TRUE,
+           updated_at = NOW()`,
+        [it.wb_id, it.name, it.price, it.category, it.image_url, it.fallback_url]
+      );
+      saved++;
+    }
+    console.log(`[sync] saved ${saved} items`);
+    res.json({ success: true, saved });
+  } catch (e) {
+    console.error('[sync]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
+// 3. CATALOG
+// ============================================================
 app.get('/api/catalog', async (req, res) => {
   try {
     const { category, limit = 100, offset = 0 } = req.query;
@@ -101,7 +145,9 @@ app.get('/api/catalog', async (req, res) => {
   }
 });
 
-// 3. TRYON (с mock-fallback — никогда не роняем фронт)
+// ============================================================
+// 4. TRYON (с mock-fallback — никогда не роняем фронт)
+// ============================================================
 app.post('/api/tryon', async (req, res) => {
   const { initData, humanImg, garmentUrl, itemId } = req.body;
   const tgUser = verifyTelegramInitData(initData);
@@ -165,7 +211,10 @@ app.post('/api/tryon', async (req, res) => {
     });
   }
 });
-// Отметка о прохождении онбординга
+
+// ============================================================
+// 5. ONBOARDED
+// ============================================================
 app.post('/api/onboarded', async (req, res) => {
   const { initData } = req.body;
   const tgUser = verifyTelegramInitData(initData);
@@ -179,7 +228,9 @@ app.post('/api/onboarded', async (req, res) => {
   }
 });
 
-// 4. INVOICE
+// ============================================================
+// 6. INVOICE
+// ============================================================
 app.post('/api/create-invoice', async (req, res) => {
   const { tgId, productType } = req.body;
   let title = '10 примерок одежды', amount = 1;
@@ -209,7 +260,9 @@ app.post('/api/create-invoice', async (req, res) => {
   }
 });
 
-// 5. WEBHOOK
+// ============================================================
+// 7. WEBHOOK
+// ============================================================
 app.post('/api/webhook/telegram', async (req, res) => {
   const update = req.body;
 
@@ -246,7 +299,9 @@ app.post('/api/webhook/telegram', async (req, res) => {
   res.sendStatus(200);
 });
 
-// 6. HEALTH + CRON
+// ============================================================
+// 8. HEALTH + CRON
+// ============================================================
 app.get('/', (_req, res) => res.send('GF Style Room API ✨'));
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
