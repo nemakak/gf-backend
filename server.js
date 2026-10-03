@@ -226,7 +226,7 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// 5. TRYON (FLUX 2 LoRA Gallery + улучшенный промпт)
+// 5. TRYON (FLUX 2 LoRA Gallery + УСИЛЕННЫЙ ПРОМПТ и параметры)
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
   const { initData, humanImg, garmentUrl, itemId, isOwnProduct } = req.body;
@@ -253,21 +253,24 @@ app.post('/api/tryon', async (req, res) => {
 
     let resultUrl = null, isMock = false;
     try {
+      // ✅ УСИЛЕННЫЙ ПРОМПТ: фокус на максимальном сохранении человека и реалистичной посадке одежды
       const r = await fal.subscribe(VTON_MODEL, {
         input: {
           image_urls: [humanImg, garmentUrl],
           prompt: [
-            'Photorealistic virtual try-on.',
-            'Preserve EXACTLY the person from the first image:',
-            'same face, same facial features, same hair, same skin tone, same body proportions, same pose, same background, same lighting, same camera angle.',
-            'Only replace the clothing with the garment from the second image.',
-            'The garment must fit naturally on the body with realistic folds, wrinkles and shadows.',
-            'Keep the fabric texture, color and pattern of the garment unchanged.',
-            'Full body shot, editorial fashion photography quality, sharp focus, 4K, natural light.',
+            'Photorealistic virtual try-on, high-fidelity, editorial quality.',
+            'CRITICAL: Maintain the person from image 1 with absolute precision —',
+            'identical face, facial features, expression, hair, skin tone, body proportions, pose, background, and lighting.',
+            'The person must remain completely unchanged.',
+            'ONLY replace their existing clothing with the garment from image 2.',
+            'The new garment must fit naturally, with realistic folds, wrinkles, shadows, and fabric drape.',
+            'Preserve the garment\'s original texture, color, pattern, and details.',
+            'Full body shot, sharp focus, natural light, ultra-detailed, 4K.'
           ].join(' '),
           num_inference_steps: 50,
           guidance_scale: 3.5,
-          lora_scale: 1.15,
+          lora_scale: 1.25,          // Усилили эффект примерки (было 1.15)
+          acceleration: 'regular',   // Оптимизация для скорости и качества
           num_images: 1,
           output_format: 'jpeg',
         },
