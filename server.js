@@ -81,7 +81,35 @@ app.post('/api/auth', async (req, res) => {
 });
 
 // ============================================================
-// 2. SYNC-CATALOG (из Google Apps Script)
+// 2. ПРОКСИ ДЛЯ КАРТИНОК WB (обход hotlink-блокировки)
+// ============================================================
+app.get('/api/img', async (req, res) => {
+  const { url } = req.query;
+  if (!url || !/^https:\/\/[a-z0-9-]+\.wbbasket\.ru\//.test(url)) {
+    return res.status(400).send('Bad url');
+  }
+  try {
+    const r = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
+        'Referer': 'https://www.wildberries.ru/',
+        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
+      },
+    });
+    if (!r.ok) return res.status(404).send('Not found');
+    const buf = await r.buffer();
+    res.set('Content-Type', r.headers.get('content-type') || 'image/webp');
+    res.set('Cache-Control', 'public, max-age=604800, immutable');
+    res.send(buf);
+  } catch (e) {
+    console.error('[img]', e.message);
+    res.status(500).send('Proxy error');
+  }
+});
+
+// ============================================================
+// 3. SYNC-CATALOG (из Google Apps Script)
 // ============================================================
 app.post('/api/sync-catalog', async (req, res) => {
   const { items, secret } = req.body;
@@ -121,7 +149,7 @@ app.post('/api/sync-catalog', async (req, res) => {
 });
 
 // ============================================================
-// 3. CATALOG
+// 4. CATALOG
 // ============================================================
 app.get('/api/catalog', async (req, res) => {
   try {
@@ -146,7 +174,7 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// 4. TRYON (с mock-fallback)
+// 5. TRYON (с mock-fallback)
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
   const { initData, humanImg, garmentUrl, itemId } = req.body;
@@ -213,7 +241,7 @@ app.post('/api/tryon', async (req, res) => {
 });
 
 // ============================================================
-// 5. ONBOARDED
+// 6. ONBOARDED
 // ============================================================
 app.post('/api/onboarded', async (req, res) => {
   const { initData } = req.body;
@@ -229,7 +257,7 @@ app.post('/api/onboarded', async (req, res) => {
 });
 
 // ============================================================
-// 6. INVOICE (1 звезда)
+// 7. INVOICE (1 звезда)
 // ============================================================
 app.post('/api/create-invoice', async (req, res) => {
   const { tgId, productType } = req.body;
@@ -261,7 +289,7 @@ app.post('/api/create-invoice', async (req, res) => {
 });
 
 // ============================================================
-// 7. WEBHOOK
+// 8. WEBHOOK
 // ============================================================
 app.post('/api/webhook/telegram', async (req, res) => {
   const update = req.body;
@@ -300,7 +328,7 @@ app.post('/api/webhook/telegram', async (req, res) => {
 });
 
 // ============================================================
-// 8. HEALTH + CRON
+// 9. HEALTH + CRON
 // ============================================================
 app.get('/', (_req, res) => res.send('GF Style Room API ✨'));
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
