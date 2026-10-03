@@ -26,10 +26,11 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const VTON_MODEL = 'fal-ai/flux-2-lora-gallery/virtual-tryon';
 fal.config({ credentials: process.env.FAL_KEY });
 
+// ===== ПОДПИСКИ =====
 const SUBSCRIPTIONS = {
-  sub_pro:    { title: 'Подписка PRО',    stars: 599, tries: 50 },
-  sub_medium: { title: 'Подписка MEDIUM', stars: 299, tries: 30 },
-  sub_start:  { title: 'Подписка START',  stars: 65,  tries: 10 },
+  sub_pro:    { title: 'Подписка PRО',    stars: 599, tries: 50, own: 20 },
+  sub_medium: { title: 'Подписка MEDIUM', stars: 299, tries: 30, own: 10 },
+  sub_start:  { title: 'Подписка START',  stars: 65,  tries: 10, own: 0  },
 };
 
 function verifyTelegramInitData(initData) {
@@ -67,8 +68,8 @@ app.post('/api/auth', async (req, res) => {
         }
       }
       const ins = await pool.query(
-        `INSERT INTO users (tg_id, username, first_name, photo_url, balance, ref_by)
-         VALUES ($1,$2,$3,$4,3,$5) RETURNING *`,
+        `INSERT INTO users (tg_id, username, first_name, photo_url, balance, own_tries, sub_active, ref_by)
+         VALUES ($1,$2,$3,$4,3,0,FALSE,$5) RETURNING *`,
         [tgId, username || null, first_name || null, photo_url || null, inviterId]
       );
       return res.json({ success: true, user: ins.rows[0] });
@@ -87,7 +88,7 @@ app.post('/api/auth', async (req, res) => {
 });
 
 // ============================================================
-// 2. ПРОКСИ ДЛЯ КАРТИНОК
+// 2. ПРОКСИ ДЛЯ КАРТИНОК (WB + Google Drive)
 // ============================================================
 app.get('/api/img', async (req, res) => {
   const { url } = req.query;
@@ -110,7 +111,9 @@ app.get('/api/img', async (req, res) => {
     const r = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36',
-        'Referer': host.includes('wbbasket') || host.includes('wbstatic') ? 'https://www.wildberries.ru/' : 'https://google.com/',
+        'Referer': (host.includes('wbbasket') || host.includes('wbstatic'))
+          ? 'https://www.wildberries.ru/'
+          : 'https://google.com/',
         'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
       },
       redirect: 'follow',
@@ -127,7 +130,7 @@ app.get('/api/img', async (req, res) => {
 });
 
 // ============================================================
-// 3. SYNC-CATALOG
+// 3. SYNC-CATALOG (из Apps Script)
 // ============================================================
 app.post('/api/sync-catalog', async (req, res) => {
   const { items, secret } = req.body;
@@ -158,7 +161,7 @@ app.post('/api/sync-catalog', async (req, res) => {
 });
 
 // ============================================================
-// 3.5. FIX-DRIVE-URLS — починить старые URL Google Drive
+// 3.5. FIX-DRIVE-URLS
 // ============================================================
 app.post('/api/fix-drive-urls', async (req, res) => {
   const { items, secret } = req.body;
@@ -185,7 +188,7 @@ app.post('/api/fix-drive-urls', async (req, res) => {
 });
 
 // ============================================================
-// 4. CATALOG
+// 4. CATALOG (с сортировкой: аксессуары в конце)
 // ============================================================
 app.get('/api/catalog', async (req, res) => {
   try {
@@ -197,10 +200,23 @@ app.get('/api/catalog', async (req, res) => {
       where += ` AND category = $${params.length}`;
     }
     params.push(Number(limit), Number(offset));
-    const q = `SELECT id, wb_id, name, price, category, image_url, fallback_url
-               FROM products ${where}
-               ORDER BY updated_at DESC, id DESC
-               LIMIT $${params.length - 1} OFFSET $${params.length}`;
+    const q = `
+      SELECT id, wb_id, name, price, category, image_url, fallback_url
+      FROM products ${where}
+      ORDER BY
+        CASE category
+          WHEN 'dress' THEN 1
+          WHEN 'top' THEN 2
+          WHEN 'outerwear' THEN 3
+          WHEN 'suit' THEN 4
+          WHEN 'bottom' THEN 5
+          WHEN 'shoes' THEN 6
+          WHEN 'accessory' THEN 99
+          ELSE 50
+        END,
+        updated_at DESC,
+        id DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}`;
     const r = await pool.query(q, params);
     res.json({ success: true, items: r.rows });
   } catch (e) {
@@ -210,10 +226,10 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// 5. TRYON
+// 5. TRYON (с учётом own_tries)
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
-  const { initData, humanImg, garmentUrl, itemId } = req.body;
+  const { initData, humanImg, garmentUrl, itemId, isOwnProduct } = req.body;
   const tgUser = verifyTelegramInitData(initData);
   if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
 
@@ -225,8 +241,20 @@ app.post('/api/tryon', async (req, res) => {
     const user = u.rows[0];
 
     const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
-    if (!hasUnlimited && user.balance <= 0) return res.status(402).json({ error: 'No tries left' });
-    if (!hasUnlimited) await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
+
+    if (!hasUnlimited) {
+      if (isOwnProduct === true) {
+        if ((user.own_tries || 0) <= 0) {
+          return res.status(402).json({ error: 'Нет попыток для своих товаров' });
+        }
+        await pool.query('UPDATE users SET own_tries = own_tries - 1 WHERE tg_id = $1', [tgId]);
+      } else {
+        if (user.balance <= 0) {
+          return res.status(402).json({ error: 'No tries left' });
+        }
+        await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
+      }
+    }
 
     let resultUrl = null, isMock = false;
     try {
@@ -326,7 +354,7 @@ app.post('/api/create-invoice', async (req, res) => {
 });
 
 // ============================================================
-// 8. WEBHOOK
+// 8. WEBHOOK (зачисление подписок + pack10)
 // ============================================================
 app.post('/api/webhook/telegram', async (req, res) => {
   const update = req.body;
@@ -351,6 +379,7 @@ app.post('/api/webhook/telegram', async (req, res) => {
           'INSERT INTO payments (charge_id, tg_id, product, stars) VALUES ($1,$2,$3,$4)',
           [chargeId, tgId, productType, pay.total_amount]
         );
+
         if (productType === 'pack10') {
           await pool.query('UPDATE users SET balance = balance + 10 WHERE tg_id = $1', [tgId]);
         } else if (productType === 'pass24h') {
@@ -358,7 +387,14 @@ app.post('/api/webhook/telegram', async (req, res) => {
           await pool.query('UPDATE users SET unlimited_until = $1 WHERE tg_id = $2', [until, tgId]);
         } else if (SUBSCRIPTIONS[productType]) {
           const sub = SUBSCRIPTIONS[productType];
-          await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [sub.tries, tgId]);
+          await pool.query(
+            `UPDATE users
+               SET balance = balance + $1,
+                   own_tries = own_tries + $2,
+                   sub_active = TRUE
+             WHERE tg_id = $3`,
+            [sub.tries, sub.own || 0, tgId]
+          );
         }
       }
     } catch (e) { console.error('[webhook]', e); }
