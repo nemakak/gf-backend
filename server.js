@@ -182,11 +182,11 @@ app.post('/api/onboarded', async (req, res) => {
 // 4. INVOICE
 app.post('/api/create-invoice', async (req, res) => {
   const { tgId, productType } = req.body;
-  let title = '10 примерок одежды', amount = 150;
+  let title = '10 примерок одежды', amount = 1;
   let payload = `pack10:${tgId}:${Date.now()}`;
   if (productType === 'pass24h') {
     title = 'Суточный безлимит (24 ч)';
-    amount = 250;
+    amount = 1;
     payload = `pass24h:${tgId}:${Date.now()}`;
   }
   try {
