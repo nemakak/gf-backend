@@ -1,960 +1,1026 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import crypto from 'crypto';
+import cron from 'node-cron';
+import fetch from 'node-fetch';
+import { fal } from '@fal-ai/client';
+import { pool } from './db.js';
+import { refreshCatalog } from './wbParser.js';
 
-const BACKEND = import.meta.env.VITE_BACKEND_URL || 'https://gf-backend-uc51.onrender.com';
-const PROXY_URL = 'https://gf-images.maxgamingbrawlstars.workers.dev';
+const app = express();
+const allowed = (process.env.ALLOWED_ORIGINS || '*')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
-const CATEGORIES = [
-  { key: 'all',       label: 'Все',            emoji: '✨' },
-  { key: 'top',       label: 'Верх',           emoji: '👕' },
-  { key: 'bottom',    label: 'Низ',            emoji: '👖' },
-  { key: 'outerwear', label: 'Верхняя одежда', emoji: '🧥' },
-  { key: 'suit',      label: 'Костюмы',        emoji: '🥼' },
-  { key: 'dress',     label: 'Платья',         emoji: '👗' },
-  { key: 'accessory', label: 'Аксессуары',     emoji: '🕶' },
-];
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || allowed.includes('*') || allowed.includes(origin)) return cb(null, true);
+    cb(null, true);
+  },
+  credentials: true,
+}));
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
-const SUBS = [
-  { id: 'pro', emoji: '💎', name: 'PRО', subtitle: 'Максимум возможностей', priceOld: 999, priceNew: 599, accent: '#D4B595',
-    features: [
-      { icon: '👗', text: '50 обычных примерок' },
-      { icon: '📦', text: '20 примерок своих товаров' },
-      { icon: '🎨', text: '5 раз — примерка 2–4 вещей одновременно' },
-      { icon: '💬', text: '3 консультации стилиста' },
-    ]},
-  { id: 'medium', emoji: '💥', name: 'MEDIUM', subtitle: 'Оптимальный выбор', priceOld: 499, priceNew: 299, accent: '#B89876',
-    features: [
-      { icon: '👗', text: '30 обычных примерок' },
-      { icon: '📦', text: '10 примерок своих товаров' },
-      { icon: '💬', text: '1 консультация стилиста' },
-    ]},
-  { id: 'start', emoji: '👌', name: 'START', subtitle: 'Для знакомства', priceOld: 119, priceNew: 65, accent: '#8A6E52',
-    features: [
-      { icon: '👗', text: '10 обычных примерок' },
-      { icon: '💬', text: '1 консультация со стилистом' },
-    ]},
-];
+const BOT_TOKEN = process.env.BOT_TOKEN;
+fal.config({ credentials: process.env.FAL_KEY });
 
-const FALLBACK = [
-  { id: 1, wb_id: 183581368, name: 'Платье Y2K миди', price: '3 990 ₽', category: 'dress',
-    image_url: 'https://spb-basket-cdn-03.geobasket.ru/vol1835/part183581/183581368/images/hq/1.webp',
-    fallback_url: 'https://basket-13.wbbasket.ru/vol1835/part183581/183581368/images/big/1.webp' },
-];
+const SUBSCRIPTIONS = {
+  sub_pro:    { title: 'Подписка PRО',    stars: 599, tries: 50, own: 20 },
+  sub_medium: { title: 'Подписка MEDIUM', stars: 299, tries: 30, own: 10 },
+  sub_start:  { title: 'Подписка START',  stars: 65,  tries: 10, own: 0  },
+};
 
-const HINTS = [
-  'Обычно занимает 10–20 секунд',
-  'ИИ подбирает образ…',
-  'Почти готово ✨',
-  'Это займёт ещё чуть-чуть',
-];
-
-function haptic(t = 'light') {
-  try { window.Telegram?.WebApp?.HapticFeedback?.impactOccurred(t); } catch {}
+// ============================================================
+// HELPERS
+// ============================================================
+function verifyTelegramInitData(initData) {
+  try {
+    const p = new URLSearchParams(initData);
+    const hash = p.get('hash');
+    p.delete('hash');
+    const str = [...p.entries()].sort().map(([k, v]) => `${k}=${v}`).join('\n');
+    const key = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+    const ok = crypto.createHmac('sha256', key).update(str).digest('hex') === hash;
+    return ok ? JSON.parse(p.get('user')) : null;
+  } catch { return null; }
 }
 
-function compressImage(file, maxSide = 768, quality = 0.75) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = (e) => {
-      const img = new Image();
-      img.onload = () => {
-        let { width, height } = img;
-        const k = Math.min(1, maxSide / Math.max(width, height));
-        width = Math.round(width * k); height = Math.round(height * k);
-        const c = document.createElement('canvas');
-        c.width = width; c.height = height;
-        c.getContext('2d').drawImage(img, 0, 0, width, height);
-        res(c.toDataURL('image/jpeg', quality));
-      };
-      img.onerror = rej;
-      img.src = e.target.result;
-    };
-    r.onerror = rej;
-    r.readAsDataURL(file);
+async function tgApi(method, payload) {
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   });
+  return r.json();
+}
+const sendMessage = (chatId, text, keyboard = null) =>
+  tgApi('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...(keyboard ? { reply_markup: keyboard } : {}) });
+const editMessage = (chatId, messageId, text, keyboard = null) =>
+  tgApi('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', ...(keyboard ? { reply_markup: keyboard } : {}) });
+const answerCallback = (callbackId, text = '') =>
+  tgApi('answerCallbackQuery', { callback_query_id: callbackId, text });
+
+async function isAdmin(tgId) {
+  try {
+    const r = await pool.query('SELECT is_admin FROM users WHERE tg_id = $1', [tgId]);
+    return r.rows[0]?.is_admin === true;
+  } catch { return false; }
 }
 
-function fixDrive(u) {
-  if (!u) return u;
-  const m = u.match(/drive\.google\.com\/(?:uc\?.*id=|file\/d\/)([a-zA-Z0-9_-]+)/);
-  return m && m[1] ? `https://lh3.googleusercontent.com/d/${m[1]}` : u;
+function basketFor(id) {
+  const vol = Math.floor(id / 100000);
+  if (vol <= 143) return '01';
+  if (vol <= 287) return '02';
+  if (vol <= 431) return '03';
+  if (vol <= 719) return '04';
+  if (vol <= 1007) return '05';
+  if (vol <= 1061) return '06';
+  if (vol <= 1115) return '07';
+  if (vol <= 1169) return '08';
+  if (vol <= 1313) return '09';
+  if (vol <= 1601) return '10';
+  if (vol <= 1655) return '11';
+  if (vol <= 1919) return '12';
+  if (vol <= 2045) return '13';
+  if (vol <= 2189) return '14';
+  if (vol <= 2405) return '15';
+  if (vol <= 2621) return '16';
+  if (vol <= 2837) return '17';
+  return '18';
 }
-
-function ProductImage({ src, fallback, alt, className = '' }) {
-  const [i, setI] = useState(0);
-  const list = (() => {
-    const L = [];
-    const add = (u) => { if (u && !L.includes(u)) L.push(u); };
-    const s = fixDrive(src);
-    const f = fixDrive(fallback);
-    if (s) add(`${PROXY_URL}/?url=${encodeURIComponent(s)}`);
-    if (s) add(s);
-    if (f && f !== s) {
-      add(`${PROXY_URL}/?url=${encodeURIComponent(f)}`);
-      add(f);
-    }
-    const m = (src || '').match(/^(https:\/\/[^/]+)\/vol(\d+)\/part(\d+)\/(\d+)\//);
-    if (m) {
-      const host = m[1], id = m[4];
-      const sizes = ['hq', 'big', 'c516x688', 'c246x328', 'small'];
-      for (const size of sizes) {
-        add(`${PROXY_URL}/?url=${encodeURIComponent(`${host}/vol${m[2]}/part${m[3]}/${id}/images/${size}/1.webp`)}`);
-      }
-    }
-    add('https://placehold.co/400x500/1A1412/D4B595?text=Style+Room');
-    return L;
-  })();
-  const url = list[i] || list[list.length - 1];
-  return (
-    <img src={url} alt={alt}
-      onError={() => i < list.length - 1 && setI(i + 1)}
-      className={`object-cover bg-card ${className}`}
-      loading="lazy" />
-  );
+function primaryImageUrl(id) {
+  const vol = Math.floor(id / 100000);
+  const part = Math.floor(id / 1000);
+  return `https://spb-basket-cdn-03.geobasket.ru/vol${vol}/part${part}/${id}/images/hq/1.webp`;
 }
-
-function ProductCard({ item, onPick }) {
-  return (
-    <button
-      onClick={() => { haptic('light'); onPick(item); }}
-      className="group relative bg-card border border-border1 rounded-2xl overflow-hidden shadow-card hover:border-accentSoft active:scale-[0.98] transition-all duration-200 text-left w-full">
-      <div className="relative aspect-[3/4] overflow-hidden">
-        <ProductImage src={item.image_url} fallback={item.fallback_url} alt={item.name}
-          className="w-full h-full group-hover:scale-105 transition-transform duration-500" />
-        <div className="absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-black/70 to-transparent pointer-events-none" />
-        <div className="absolute top-2.5 left-2.5 px-2.5 py-1 rounded-full bg-bg/80 backdrop-blur border border-border2 text-[9px] uppercase tracking-wider2 text-accentSoft">
-          {CATEGORIES.find(c => c.key === item.category)?.label || 'Одежда'}
-        </div>
-        <a href={`https://www.wildberries.ru/catalog/${item.wb_id}/detail.aspx`}
-          target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}
-          className="absolute top-2.5 right-2.5 w-8 h-8 rounded-full bg-bg/80 backdrop-blur flex items-center justify-center border border-border2 text-sm hover:bg-accent hover:text-bg transition">
-          🛍
-        </a>
-        <div className="absolute bottom-2.5 left-2.5 flex items-center gap-1">
-          <span className="text-xs font-bold text-white">≈ {item.price ? item.price.replace(/^≈\s*/, '') : '—'}</span>
-        </div>
-      </div>
-      <div className="p-3">
-        <div className="font-serif text-[13px] leading-tight line-clamp-2 h-[34px] text-title">{item.description || item.name}</div>
-        <div className="mt-3 flex items-center justify-between">
-          <span className="text-[10px] uppercase tracking-wider2 text-muted">Примерить</span>
-          <span className="w-7 h-7 rounded-full border border-accentSoft text-accent flex items-center justify-center text-xs group-hover:bg-accent group-hover:text-bg transition">✨</span>
-        </div>
-      </div>
-    </button>
-  );
+function fallbackImageUrl(id) {
+  const vol = Math.floor(id / 100000);
+  const part = Math.floor(id / 1000);
+  return `https://basket-${basketFor(id)}.wbbasket.ru/vol${vol}/part${part}/${id}/images/big/1.webp`;
 }
-
-function SubscriptionsScreen({ onBack, onBuy }) {
-  const [expanded, setExpanded] = useState('pro');
-  return (
-    <main className="px-5 pt-6 animate-fade-in pb-24">
-      <div className="flex items-center gap-3 mb-6">
-        <button onClick={onBack} className="w-8 h-8 rounded-full border border-border2 flex items-center justify-center text-muted active:scale-95">←</button>
-        <div>
-          <div className="text-[10px] uppercase tracking-wider2 text-muted mb-0.5">Style Room</div>
-          <div className="font-serif text-2xl leading-tight">Подписки</div>
-        </div>
-      </div>
-      <div className="space-y-4">
-        {SUBS.map(sub => {
-          const isOpen = expanded === sub.id;
-          return (
-            <div key={sub.id} className="bg-card rounded-3xl overflow-hidden transition-all duration-300"
-              style={{ border: `1px solid ${isOpen ? sub.accent : '#2a1f1a'}`, boxShadow: isOpen ? `0 0 30px ${sub.accent}20` : 'none' }}>
-              <button onClick={() => { haptic('light'); setExpanded(isOpen ? null : sub.id); }}
-                className="w-full flex items-center justify-between px-5 py-5 text-left">
-                <div className="flex items-center gap-4">
-                  <div className="w-14 h-14 rounded-2xl flex items-center justify-center text-2xl"
-                    style={{ background: `${sub.accent}20`, border: `1px solid ${sub.accent}40` }}>
-                    {sub.emoji}
-                  </div>
-                  <div>
-                    <div className="text-[10px] uppercase tracking-wider2 mb-0.5" style={{ color: sub.accent }}>{sub.subtitle}</div>
-                    <div className="font-serif text-lg text-title leading-tight">{sub.name}</div>
-                    <div className="flex items-center gap-2 mt-1">
-                      <span className="text-xs text-muted line-through">{sub.priceOld}⭐️</span>
-                      <span className="text-base font-bold" style={{ color: sub.accent }}>{sub.priceNew}⭐️</span>
-                    </div>
-                  </div>
-                </div>
-                <span className="text-lg transition-transform duration-300" style={{ color: sub.accent, transform: isOpen ? 'rotate(180deg)' : 'rotate(0)' }}>⌄</span>
-              </button>
-              <div className="overflow-hidden transition-all duration-300 ease-out" style={{ maxHeight: isOpen ? 400 : 0 }}>
-                <div className="border-t border-border1 px-5 py-4 bg-bgSoft/40">
-                  <div className="text-[10px] uppercase tracking-wider2 text-accentSoft mb-3">Что входит</div>
-                  <ul className="space-y-3 mb-5">
-                    {sub.features.map((f, i) => (
-                      <li key={i} className="flex items-start gap-3 text-xs text-title leading-relaxed">
-                        <span className="text-base shrink-0">{f.icon}</span>
-                        <span className="pt-0.5">{f.text}</span>
-                      </li>
-                    ))}
-                  </ul>
-                  <button onClick={() => { haptic('medium'); onBuy(sub.id); }}
-                    className="w-full py-4 rounded-2xl text-xs font-bold uppercase tracking-wider2 text-bg active:scale-[0.98] transition"
-                    style={{ background: sub.accent }}>
-                    Оформить за {sub.priceNew}⭐️
-                  </button>
-                </div>
-              </div>
-            </div>
-          );
-        })}
-        <div className="text-center text-[10px] text-muted pt-2 pb-3 leading-relaxed">Оплата через Telegram Stars.<br />Попытки зачисляются автоматически.</div>
-      </div>
-    </main>
-  );
+function extractWbIds(text) {
+  const ids = new Set();
+  let m;
+  const re1 = /\/catalog\/(\d{6,})/g;
+  while ((m = re1.exec(text)) !== null) ids.add(Number(m[1]));
+  const re2 = /\b(\d{6,})\b/g;
+  while ((m = re2.exec(text)) !== null) ids.add(Number(m[1]));
+  return Array.from(ids);
 }
-
-function BuyTriesScreen({ onBack, onBuy, user }) {
-  const [count, setCount] = useState(5);
-  const total = count * 5;
-  return (
-    <main className="px-5 pt-6 animate-fade-in pb-24">
-      <div className="flex items-center gap-3 mb-6">
-        <button onClick={onBack} className="w-8 h-8 rounded-full border border-border2 flex items-center justify-center text-muted active:scale-95">←</button>
-        <div>
-          <div className="text-[10px] uppercase tracking-wider2 text-muted mb-0.5">Докупка</div>
-          <div className="font-serif text-2xl leading-tight">Попытки</div>
-        </div>
-      </div>
-      <div className="bg-card border border-border1 rounded-3xl p-6 mb-5 text-center">
-        <div className="text-[10px] uppercase tracking-wider2 text-muted mb-2">Сколько примерок?</div>
-        <div className="flex items-center justify-center gap-4 mb-4">
-          <button onClick={() => { haptic('light'); setCount(c => Math.max(1, c - 1)); }}
-            className="w-12 h-12 rounded-full border border-border2 text-2xl text-accent active:scale-90">−</button>
-          <div className="text-5xl font-serif text-title min-w-[100px]">{count}</div>
-          <button onClick={() => { haptic('light'); setCount(c => Math.min(500, c + 1)); }}
-            className="w-12 h-12 rounded-full border border-accentSoft text-2xl text-accent active:scale-90">+</button>
-        </div>
-        <div className="flex gap-2 justify-center mb-5">
-          {[5, 10, 25, 50].map(n => (
-            <button key={n} onClick={() => { haptic('light'); setCount(n); }}
-              className={`px-3 py-1.5 rounded-full border text-xs ${count === n ? 'bg-accent text-bg border-accent font-bold' : 'border-border2 text-muted2'}`}>
-              {n}
-            </button>
-          ))}
-        </div>
-        <div className="text-[10px] uppercase tracking-wider2 text-muted">Итого</div>
-        <div className="text-3xl font-serif text-title mt-1">{total}⭐️</div>
-        <div className="text-[10px] text-muted mt-2">1 примерка = 5⭐️</div>
-      </div>
-      <div className="bg-card border border-border1 rounded-2xl p-4 mb-5">
-        <div className="text-[10px] uppercase tracking-wider2 text-accentSoft mb-2">У вас сейчас</div>
-        <div className="flex items-center justify-between">
-          <span className="text-sm text-title">Обычных примерок</span>
-          <span className="text-lg font-serif text-accent">{user?.balance ?? 0}</span>
-        </div>
-      </div>
-      <button onClick={() => { haptic('medium'); onBuy(count); }}
-        className="w-full bg-accent hover:bg-accentH text-bg py-4 rounded-2xl text-sm font-bold uppercase tracking-wider2 active:scale-[0.98] transition">
-        Купить {count} за {total}⭐️
-      </button>
-    </main>
-  );
-}
-
-function HistoryScreen({ onBack }) {
-  const [items, setItems] = useState([]);
-  const [loading, setLoading] = useState(true);
-  useEffect(() => {
-    const initData = window.Telegram?.WebApp?.initData || '';
-    fetch(`${BACKEND}/api/history`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData }),
-    })
-      .then(r => r.json())
-      .then(d => { if (d.success) setItems(d.items || []); })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
-
-  const share = (url) => {
-    const text = 'Смотри, как я примерила вещь через Style Room ✨';
-    if (window.Telegram?.WebApp?.openTelegramLink) {
-      window.Telegram.WebApp.openTelegramLink(`https://t.me/share/url?url=${encodeURIComponent(url)}&text=${encodeURIComponent(text)}`);
-    } else {
-      window.open(`https://t.me/share/url?url=${encodeURIComponent(url)}&text=${encodeURIComponent(text)}`, '_blank');
-    }
+async function fetchWBProductInfo(wbId) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'ru-RU,ru;q=0.9',
+    'Origin': 'https://www.wildberries.ru',
+    'Referer': 'https://www.wildberries.ru/',
   };
-
-  return (
-    <main className="px-5 pt-6 animate-fade-in pb-24">
-      <div className="flex items-center gap-3 mb-6">
-        <button onClick={onBack} className="w-8 h-8 rounded-full border border-border2 flex items-center justify-center text-muted active:scale-95">←</button>
-        <div>
-          <div className="text-[10px] uppercase tracking-wider2 text-muted mb-0.5">Архив</div>
-          <div className="font-serif text-2xl leading-tight">Мои примерки</div>
-        </div>
-      </div>
-      {loading && <div className="text-center py-16 text-muted text-sm">Загрузка…</div>}
-      {!loading && items.length === 0 && (
-        <div className="text-center py-16">
-          <div className="text-5xl mb-4">👗</div>
-          <div className="text-sm text-title mb-2">Здесь пока пусто</div>
-          <div className="text-xs text-muted">Сделайте первую примерку</div>
-        </div>
-      )}
-      <div className="grid grid-cols-2 gap-3">
-        {items.map(it => (
-          <div key={it.id} className="bg-card border border-border1 rounded-2xl overflow-hidden">
-            <div className="aspect-[3/4] bg-cardHover">
-              <img src={it.result_url} alt="" className="w-full h-full object-cover" loading="lazy"
-                onError={(e) => { e.target.src = 'https://placehold.co/400x500/1A1412/D4B595?text=Style+Room'; }} />
-            </div>
-            <div className="p-2.5">
-              <div className="text-[10px] text-muted line-clamp-2 h-[26px]">{it.product_name || 'Товар'}</div>
-              <div className="flex gap-1.5 mt-2">
-                <button onClick={() => share(it.result_url)}
-                  className="flex-1 bg-bgSoft border border-border2 text-accent text-[10px] uppercase tracking-wider2 py-2 rounded-xl active:scale-95">Share</button>
-                {it.product_wb_id && (
-                  <a href={`https://www.wildberries.ru/catalog/${it.product_wb_id}/detail.aspx`} target="_blank" rel="noreferrer"
-                    className="flex-1 bg-accent text-bg text-[10px] uppercase tracking-wider2 py-2 rounded-xl text-center font-bold">WB</a>
-                )}
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </main>
-  );
-}
-
-function ProfileScreen({ user, onOpenSubs, onOpenBuyTries, onOpenHistory, onToast }) {
-  const balance = user?.balance || 0;
-  const ownTries = user?.own_tries || 0;
-  const hasSub = user?.sub_active === true && (user?.balance || 0) > 0;
-  const [promoOpen, setPromoOpen] = useState(false);
-  const [promoCode, setPromoCode] = useState('');
-  const [promoLoading, setPromoLoading] = useState(false);
-
-  const redeemPromo = async () => {
-    if (!promoCode.trim()) return;
-    setPromoLoading(true);
-    try {
-      const r = await fetch(`${BACKEND}/api/redeem-promo`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData: window.Telegram?.WebApp?.initData || '', code: promoCode.trim() }),
-      });
-      const d = await r.json();
-      if (d.success) {
-        onToast(d.unlimited ? '🎁 Безлимит на 24 часа!' : `🎁 +${d.tries} попыток!`);
-        setPromoOpen(false);
-        setPromoCode('');
-        setTimeout(() => window.location.reload(), 1500);
-      } else {
-        onToast(d.error || 'Ошибка');
-      }
-    } catch { onToast('Ошибка соединения'); }
-    finally { setPromoLoading(false); }
-  };
-
-  return (
-    <main className="px-5 pt-6 animate-fade-in pb-24">
-      <div className="mb-6">
-        <div className="text-[10px] uppercase tracking-wider2 text-muted mb-1">Аккаунт</div>
-        <h1 className="font-serif text-3xl leading-tight">Профиль</h1>
-      </div>
-
-      <div className="bg-card border border-border1 rounded-3xl p-5 mb-4">
-        <div className="flex items-center gap-4">
-          <div className="relative">
-            <img src={user?.photo_url || 'https://placehold.co/120x120/1A1412/D4B595?text=U'} alt=""
-              className="w-16 h-16 rounded-full object-cover border-2 border-border2" />
-            <div className="absolute -bottom-1 -right-1 w-4 h-4 rounded-full bg-accent border-2 border-bg" />
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="text-base font-medium leading-tight truncate">{user?.first_name || 'Гость'}</div>
-            <div className="text-xs text-muted truncate">@{user?.username || 'user'}</div>
-            {hasSub ? (
-              <div className="inline-flex items-center gap-1.5 mt-2 px-2.5 py-1 rounded-full"
-                style={{ background: 'rgba(212,181,149,0.15)', border: '1px solid rgba(212,181,149,0.4)' }}>
-                <span className="text-[10px]">💎</span>
-                <span className="text-[10px] font-bold text-accent uppercase tracking-wider2">Подписка активна</span>
-              </div>
-            ) : (
-              <button onClick={onOpenSubs}
-                className="inline-flex items-center gap-1.5 mt-2 px-2.5 py-1 rounded-full border border-border2 active:scale-95 transition">
-                <span className="text-[10px]">💎</span>
-                <span className="text-[10px] font-medium text-muted uppercase tracking-wider2">Оформить</span>
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-2 gap-3 mb-4">
-        <button onClick={onOpenBuyTries} className="bg-card border border-border1 hover:border-accentSoft active:scale-[0.98] rounded-2xl p-4 text-left transition relative">
-          <div className="text-2xl mb-1">👗</div>
-          <div className="text-3xl font-serif text-title leading-none">{balance}</div>
-          <div className="text-[10px] uppercase tracking-wider2 text-muted mt-2">Обычных примерок</div>
-          <div className="absolute top-3 right-3 w-7 h-7 rounded-full bg-accent text-bg flex items-center justify-center text-lg font-bold">+</div>
-        </button>
-        <div className="bg-card border border-border1 rounded-2xl p-4">
-          <div className="text-2xl mb-1">📦</div>
-          <div className="text-3xl font-serif text-title leading-none">{ownTries}</div>
-          <div className="text-[10px] uppercase tracking-wider2 text-muted mt-2">Своих товаров</div>
-        </div>
-      </div>
-
-      <div className="space-y-2 mb-4">
-        <button onClick={onOpenHistory}
-          className="w-full bg-card border border-border1 hover:border-accentSoft active:scale-[0.99] rounded-2xl px-4 py-4 flex items-center justify-between transition">
-          <div className="flex items-center gap-3">
-            <span className="text-xl">🕓</span>
-            <div className="text-left">
-              <div className="text-sm font-medium text-title">Предыдущие примерки</div>
-              <div className="text-[10px] text-muted">История и покупки на WB</div>
-            </div>
-          </div>
-          <span className="text-muted">→</span>
-        </button>
-        <button onClick={onOpenSubs}
-          className="w-full bg-card border border-border1 hover:border-accentSoft active:scale-[0.99] rounded-2xl px-4 py-4 flex items-center justify-between transition">
-          <div className="flex items-center gap-3">
-            <span className="text-xl">💎</span>
-            <div className="text-left">
-              <div className="text-sm font-medium text-title">Подписки</div>
-              <div className="text-[10px] text-muted">Больше попыток и возможностей</div>
-            </div>
-          </div>
-          <span className="text-muted">→</span>
-        </button>
-        <button onClick={onOpenBuyTries}
-          className="w-full bg-card border border-border1 hover:border-accentSoft active:scale-[0.99] rounded-2xl px-4 py-4 flex items-center justify-between transition">
-          <div className="flex items-center gap-3">
-            <span className="text-xl">✨</span>
-            <div className="text-left">
-              <div className="text-sm font-medium text-title">Докупить попытки</div>
-              <div className="text-[10px] text-muted">1 примерка = 5⭐️</div>
-            </div>
-          </div>
-          <span className="text-muted">→</span>
-        </button>
-      </div>
-
-      {!promoOpen ? (
-        <button onClick={() => setPromoOpen(true)}
-          className="w-full bg-bgSoft border border-accentSoft text-accent rounded-2xl px-4 py-4 flex items-center justify-center gap-2 active:scale-[0.99] transition">
-          <span>🎁</span>
-          <span className="text-sm font-medium">Ввести промокод</span>
-        </button>
-      ) : (
-        <div className="bg-card border border-accentSoft rounded-2xl p-4 animate-fade-in">
-          <div className="text-[10px] uppercase tracking-wider2 text-accent mb-2">🎁 Промокод</div>
-          <div className="flex gap-2">
-            <input
-              value={promoCode}
-              onChange={(e) => setPromoCode(e.target.value.toUpperCase())}
-              placeholder="ВВЕДИ КОД"
-              disabled={promoLoading}
-              autoComplete="off"
-              className="flex-1 bg-bg border border-border1 rounded-xl px-3 py-3 text-sm outline-none focus:border-accentSoft placeholder:text-muted uppercase"
-            />
-            <button onClick={redeemPromo} disabled={promoLoading || !promoCode.trim()}
-              className="px-4 py-3 rounded-xl bg-accent text-bg text-xs font-bold uppercase tracking-wider2 disabled:opacity-40">
-              {promoLoading ? '…' : 'Применить'}
-            </button>
-          </div>
-          <button onClick={() => { setPromoOpen(false); setPromoCode(''); }}
-            className="text-[10px] text-muted mt-3">Отмена</button>
-        </div>
-      )}
-
-      <div className="text-center text-[10px] text-muted pt-6">Style Room · v1.0</div>
-    </main>
-  );
-}
-
-function SearchScreen({ catalog, onPick }) {
-  const [q, setQ] = useState('');
-  const inputRef = useRef(null);
-
-  useEffect(() => {
-    const t = setTimeout(() => {
-      try { inputRef.current?.focus({ preventScroll: true }); } catch {}
-    }, 300);
-    return () => clearTimeout(t);
-  }, []);
-
-  const dismissKeyboard = () => {
-    try { inputRef.current?.blur(); } catch {}
-    haptic('light');
-  };
-
-  const results = q.trim()
-    ? catalog.filter(p => p.name.toLowerCase().includes(q.toLowerCase().trim()))
-    : [];
-
-  return (
-    <main className="px-5 pt-6 animate-fade-in pb-24">
-      <div className="mb-6">
-        <div className="text-[10px] uppercase tracking-wider2 text-muted mb-1">Найти вещь</div>
-        <h1 className="font-serif text-3xl leading-tight">Поиск</h1>
-      </div>
-
-      <form onSubmit={(e) => { e.preventDefault(); dismissKeyboard(); }} className="relative mb-3">
-        <input
-          ref={inputRef}
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') dismissKeyboard(); }}
-          placeholder="Название, категория…"
-          enterKeyHint="done"
-          inputMode="search"
-          autoComplete="off"
-          autoCorrect="off"
-          spellCheck="false"
-          className="w-full bg-card border border-border1 rounded-2xl pl-11 pr-12 py-3.5 text-sm outline-none focus:border-accentSoft placeholder:text-muted transition"
-        />
-        <svg className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-          <circle cx="11" cy="11" r="7" /><path d="m21 21-4.35-4.35" />
-        </svg>
-        {q && (
-          <button type="button"
-            onClick={() => { setQ(''); dismissKeyboard(); }}
-            className="absolute right-3 top-1/2 -translate-y-1/2 w-6 h-6 rounded-full border border-border2 text-muted flex items-center justify-center text-xs">
-            ✕
-          </button>
-        )}
-      </form>
-
-      <button
-        type="button"
-        onClick={dismissKeyboard}
-        className="w-full bg-bgSoft border border-border2 text-accent py-3 rounded-2xl text-xs font-medium uppercase tracking-wider2 mb-6 active:scale-[0.98] transition"
-      >
-        ⌨️ Готово — скрыть клавиатуру
-      </button>
-
-      {!q.trim() && (
-        <div className="text-center py-20">
-          <div className="text-6xl mb-4">🔍</div>
-          <div className="font-serif text-lg text-title mb-2">Что будем искать?</div>
-          <div className="text-xs text-muted max-w-xs mx-auto">Введите название вещи или категорию</div>
-        </div>
-      )}
-      {q.trim() && results.length === 0 && (
-        <div className="text-center py-16 text-muted text-sm">Ничего не найдено</div>
-      )}
-      {q.trim() && results.length > 0 && (
-        <div className="grid grid-cols-2 gap-3">
-          {results.map(item => <ProductCard key={item.id} item={item} onPick={onPick} />)}
-        </div>
-      )}
-    </main>
-  );
-}
-
-const SLIDES = [
-  { emoji: '✨', title: 'Примерь любой образ', text: 'Загрузите фото в полный рост, выберите вещь — ИИ покажет, как она сидит именно на вас' },
-  { emoji: '🛍️', title: 'Актуальные тренды WB', text: 'Каталог обновляется автоматически — свежие находки Wildberries всегда под рукой' },
-  { emoji: '👥', title: 'Приглашай подруг', text: 'За каждую подругу, которая сделает первую примерку, вы обе получите +3 попытки' },
-];
-
-function Onboarding({ onDone }) {
-  const [i, setI] = useState(0);
-  const last = i === SLIDES.length - 1;
-  const s = SLIDES[i];
-  const next = () => { haptic('medium'); last ? onDone() : setI(i + 1); };
-  return (
-    <div className="min-h-screen flex flex-col px-8 pt-16 pb-10 bg-bg">
-      <div className="flex justify-center gap-2 mb-12">
-        {SLIDES.map((_, k) => <div key={k} className={`h-[3px] rounded-full transition-all duration-300 ${k === i ? 'w-8 bg-accent' : 'w-2 bg-border2'}`} />)}
-      </div>
-      <div key={i} className="flex-1 flex flex-col items-center justify-center text-center animate-slide-up">
-        <div className="text-7xl mb-8">{s.emoji}</div>
-        <h2 className="font-serif text-3xl mb-4 leading-tight">{s.title}</h2>
-        <p className="text-sm text-muted2 leading-relaxed max-w-xs">{s.text}</p>
-      </div>
-      <button onClick={next} className="w-full bg-accent hover:bg-accentH text-bg py-4 rounded-2xl text-sm font-medium uppercase tracking-wider2 active:scale-[0.98] transition">
-        {last ? 'Начать' : 'Продолжить'}
-      </button>
-      {!last && <button onClick={onDone} className="mt-4 text-xs text-muted">Пропустить</button>}
-    </div>
-  );
-}
-
-function BottomNav({ active, onChange }) {
-  const items = [
-    { key: 'catalog', label: 'Разделы',  emoji: '🗂' },
-    { key: 'search',  label: 'Поиск',    emoji: '🔍' },
-    { key: 'subs',    label: 'Подписка', emoji: '💎' },
-    { key: 'profile', label: 'Профиль',  emoji: '👤' },
+  const urls = [
+    `https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm=${wbId}`,
+    `https://card.wb.ru/cards/v1/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm=${wbId}`,
+    `https://u-card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&nm=${wbId}`,
+    `https://basket-${basketFor(wbId)}.wbbasket.ru/vol${Math.floor(wbId/100000)}/part${Math.floor(wbId/1000)}/${wbId}/info/ru/card.json`,
   ];
-  return (
-    <nav className="fixed bottom-0 left-0 right-0 z-30 bg-bg/95 backdrop-blur-md border-t border-border1 px-3 pt-2"
-      style={{ paddingBottom: 'max(env(safe-area-inset-bottom, 8px), 8px)' }}>
-      <div className="flex items-center justify-around max-w-md mx-auto">
-        {items.map(it => {
-          const isActive = active === it.key;
-          return (
-            <button key={it.key} onClick={() => { haptic('light'); onChange(it.key); }}
-              className="flex flex-col items-center gap-1 py-2 px-3 rounded-xl min-w-[60px] active:scale-95 transition">
-              <span className={`text-lg transition-opacity ${isActive ? 'opacity-100' : 'opacity-50'}`}>{it.emoji}</span>
-              <span className={`text-[9px] uppercase tracking-wider2 transition ${isActive ? 'text-accent font-bold' : 'text-muted'}`}>{it.label}</span>
-              {isActive && <div className="w-1 h-1 rounded-full bg-accent" />}
-            </button>
-          );
-        })}
-      </div>
-    </nav>
-  );
-}
-
-export default function App() {
-  const [user, setUser] = useState(null);
-  const [showOnboarding, setShowOnboarding] = useState(false);
-  const [tab, setTab] = useState('catalog');
-  const [screen, setScreen] = useState(null);
-  const [catalog, setCatalog] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [category, setCategory] = useState('all');
-  const [selected, setSelected] = useState(null);
-  const [humanImg, setHumanImg] = useState('');
-  const [resultImage, setResultImage] = useState(null);
-  const [viral, setViral] = useState(false);
-  const [toast, setToast] = useState('');
-  const [hintIdx, setHintIdx] = useState(0);
-  const fileRef = useRef(null);
-
-  const showToast = (m) => { setToast(m); setTimeout(() => setToast(''), 2500); };
-
-  // Подсказки во время загрузки примерки
-  useEffect(() => {
-    if (tab !== 'loading') return;
-    setHintIdx(0);
-    const t = setInterval(() => setHintIdx(i => (i + 1) % HINTS.length), 4000);
-    return () => clearInterval(t);
-  }, [tab]);
-
-  useEffect(() => {
-    const tg = window.Telegram?.WebApp;
-    if (tg) {
-      tg.ready(); tg.expand();
-      tg.setHeaderColor?.('#0C0A08');
-      tg.setBackgroundColor?.('#0C0A08');
-      tg.disableVerticalSwipes?.();
-    }
-    const initData = tg?.initData || '';
-    const startParam = tg?.initDataUnsafe?.start_param;
-
-    fetch(`${BACKEND}/api/auth`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initData, refCode: startParam }),
-    })
-      .then(r => r.json())
-      .then(d => {
-        if (d.success) {
-          setUser(d.user);
-          if (!d.user.onboarded && localStorage.getItem('gf_onboarded') !== '1') setShowOnboarding(true);
-        } else setUserGuest();
-      })
-      .catch(() => setUserGuest());
-  }, []);
-
-  const setUserGuest = () => setUser({
-    tg_id: 0, first_name: 'Ошибка авторизации', username: '—', photo_url: '',
-    balance: 0, own_tries: 0, sub_active: false, onboarded: true,
-  });
-
-  const finishOnboarding = async () => {
-    localStorage.setItem('gf_onboarded', '1');
-    setShowOnboarding(false);
+  for (const url of urls) {
     try {
-      await fetch(`${BACKEND}/api/onboarded`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ initData: window.Telegram?.WebApp?.initData || '' }),
-      });
-    } catch {}
-  };
-
-  const loadCatalog = useCallback(async (cat) => {
-    setLoading(true);
-    try {
-      const q = cat && cat !== 'all' ? `?category=${encodeURIComponent(cat)}` : '';
-      const r = await fetch(`${BACKEND}/api/catalog${q}`);
-      const d = await r.json();
-      setCatalog(d.success && d.items.length ? d.items : FALLBACK);
-    } catch { setCatalog(FALLBACK); }
-    finally { setLoading(false); }
-  }, []);
-
-  useEffect(() => { loadCatalog(category); }, [category, loadCatalog]);
-
-  const share = () => {
-    haptic('medium');
-    const refLink = `https://t.me/GFstyleroom_bot/app?startapp=ref_${user?.tg_id || 0}`;
-    const text = 'Смотри, какое крутое мини-приложение с примеркой одежды ✨';
-    const url = `https://t.me/share/url?url=${encodeURIComponent(refLink)}&text=${encodeURIComponent(text)}`;
-    if (window.Telegram?.WebApp?.openTelegramLink) window.Telegram.WebApp.openTelegramLink(url);
-    else window.open(url, '_blank');
-  };
-
-  const onPickFile = async (e) => {
-    const f = e.target.files?.[0]; if (!f) return;
-    try {
-      setHumanImg(await compressImage(f, 768, 0.75));
-      showToast('Фото загружено');
-    } catch { showToast('Не удалось обработать фото'); }
-  };
-
-  const buySubscription = async (subId) => {
-    haptic('medium');
-    if (!user?.tg_id) return showToast('Откройте в Telegram');
-    try {
-      const r = await fetch(`${BACKEND}/api/create-invoice`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tgId: user.tg_id, productType: `sub_${subId}` }),
-      });
-      const d = await r.json();
-      if (!d.invoiceLink) throw new Error(d.error || 'no invoice');
-      window.Telegram.WebApp.openInvoice(d.invoiceLink, (s) => {
-        if (s === 'paid') { showToast('Подписка активирована ✨'); setTimeout(() => window.location.reload(), 1500); }
-      });
-    } catch { showToast('Ошибка оплаты'); }
-  };
-
-  const buyTries = async (count) => {
-    haptic('medium');
-    if (!user?.tg_id) return showToast('Откройте в Telegram');
-    try {
-      const r = await fetch(`${BACKEND}/api/create-invoice`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tgId: user.tg_id, productType: 'custom_tries', tries: count }),
-      });
-      const d = await r.json();
-      if (!d.invoiceLink) throw new Error(d.error || 'no invoice');
-      window.Telegram.WebApp.openInvoice(d.invoiceLink, (s) => {
-        if (s === 'paid') { showToast('Попытки зачислены ✨'); setTimeout(() => window.location.reload(), 1500); }
-      });
-    } catch { showToast('Ошибка оплаты'); }
-  };
-
-  const runTryOn = async () => {
-    if (!selected) return showToast('Выберите товар');
-    if (!humanImg) return showToast('Загрузите фото');
-    haptic('medium');
-    setTab('loading');
-    const t0 = Date.now();
-    try {
-      const r = await fetch(`${BACKEND}/api/tryon`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          initData: window.Telegram?.WebApp?.initData || '',
-          humanImg,
-          garmentUrl: selected.image_url,
-          itemId: selected.id,
-          isAccessory: selected.category === 'accessory',
-          category: selected.category,
-        }),
-      });
-      const d = await r.json();
-      console.log(`[tryon] ответ за ${Date.now() - t0}ms:`, d);
-      if (d.success && d.resultUrl) {
-        setResultImage(d.resultUrl);
-        setUser(u => u ? { ...u, balance: Math.max(0, (u.balance || 0) - 1) } : u);
-        setTab('result');
-        if (Math.random() < 0.3) setTimeout(() => setViral(true), 800);
-      } else {
-        showToast(d.error || 'Ошибка примерки');
-        setTab('catalog');
+      const r = await fetch(url, { headers });
+      if (!r.ok) continue;
+      const data = await r.json();
+      const p1 = data?.data?.products?.[0];
+      if (p1?.name) return { wb_id: wbId, name: p1.name, price: p1.salePriceU ? `${Math.round(p1.salePriceU/100).toLocaleString('ru-RU')} ₽` : null };
+      const name2 = data?.imt_name || data?.subj_name;
+      if (name2) {
+        const price2 = data?.sizes?.[0]?.price?.total ? `${Math.round(data.sizes[0].price.total/100).toLocaleString('ru-RU')} ₽` : null;
+        return { wb_id: wbId, name: name2, price: price2 };
       }
-    } catch {
-      showToast('Ошибка соединения');
-      setTab('catalog');
-    }
-  };
-
-  const resetTryOn = () => { setTab('catalog'); setSelected(null); setResultImage(null); setHumanImg(''); };
-
-  if (!user) return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-bg">
-      <div className="spinner mb-6" />
-      <div className="text-xs text-muted tracking-wider2 uppercase">Загрузка</div>
-    </div>
-  );
-
-  if (showOnboarding) return <Onboarding onDone={finishOnboarding} />;
-
-  const isTryOn = tab === 'upload' || tab === 'loading' || tab === 'result';
-
-  if (screen === 'subs') return <><SubscriptionsScreen onBack={() => setScreen(null)} onBuy={buySubscription} /><BottomNav active="subs" onChange={(k) => { setScreen(null); setTab(k); }} /></>;
-  if (screen === 'buyTries') return <><BuyTriesScreen onBack={() => setScreen(null)} onBuy={buyTries} user={user} /><BottomNav active="profile" onChange={(k) => { setScreen(null); setTab(k); }} /></>;
-  if (screen === 'history') return <><HistoryScreen onBack={() => setScreen(null)} /><BottomNav active="profile" onChange={(k) => { setScreen(null); setTab(k); }} /></>;
-
-  return (
-    <div className="min-h-screen bg-bg text-title pb-24">
-      {!isTryOn && (
-        <header className="sticky top-0 z-40 bg-bg/85 backdrop-blur-md border-b border-border1 px-5 py-3.5">
-          <div className="flex items-center justify-between">
-            <button onClick={() => { haptic('light'); setTab('profile'); }} className="flex items-center gap-3 active:scale-95 transition">
-              <img src={user.photo_url || 'https://placehold.co/80x80/1A1412/D4B595?text=U'} alt=""
-                className="w-9 h-9 rounded-full object-cover border border-border2" />
-              <div className="text-left">
-                <div className="text-sm font-medium leading-tight">{user.first_name || 'Гость'}</div>
-                <div className="text-[11px] text-muted">@{user.username || 'user'}</div>
-              </div>
-            </button>
-            <div className="flex items-center gap-2">
-              <button onClick={() => { haptic('light'); setScreen('buyTries'); }}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-border2 active:scale-95 transition">
-                <span className="text-[11px] text-muted">✨</span>
-                <span className="text-xs font-medium">{user.balance ?? 0}</span>
-                <span className="text-accent text-sm font-bold leading-none">+</span>
-              </button>
-              <button onClick={() => { haptic('medium'); setScreen('subs'); }}
-                className="px-3 py-1.5 rounded-full bg-accent text-bg text-xs font-bold active:scale-95 transition">
-                💎
-              </button>
-            </div>
-          </div>
-        </header>
-      )}
-
-      {toast && (
-        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-card border border-border2 text-title text-xs px-4 py-2.5 rounded-full shadow-soft animate-slide-up">
-          {toast}
-        </div>
-      )}
-
-      {tab === 'catalog' && (
-        <main className="px-5 pt-6">
-          <div className="flex items-end justify-between mb-6">
-            <div>
-              <div className="text-[10px] uppercase tracking-wider2 text-muted mb-1">Коллекция</div>
-              <h1 className="font-serif text-3xl leading-tight">Гардероб</h1>
-              <p className="text-xs text-muted2 mt-1.5">Примерьте образ за секунды</p>
-            </div>
-          </div>
-          <div className="flex gap-2 overflow-x-auto no-scrollbar mb-6 -mx-5 px-5">
-            {CATEGORIES.map(c => {
-              const active = category === c.key;
-              return (
-                <button key={c.key} onClick={() => { haptic('light'); setCategory(c.key); }}
-                  className={`whitespace-nowrap text-xs px-3.5 py-2 rounded-full border flex items-center gap-1.5 transition-all duration-200 active:scale-95 ${active ? 'bg-accent text-bg border-accent font-medium' : 'border-border2 text-muted2'}`}>
-                  <span>{c.emoji}</span>{c.label}
-                </button>
-              );
-            })}
-          </div>
-          {loading ? (
-            <div className="grid grid-cols-2 gap-3">
-              {Array.from({ length: 6 }).map((_, i) => (
-                <div key={i} className="bg-card border border-border1 rounded-2xl overflow-hidden animate-pulse">
-                  <div className="aspect-[3/4] bg-border1" />
-                  <div className="p-3 space-y-2"><div className="h-2 bg-border1 rounded w-1/2" /><div className="h-3 bg-border1 rounded w-full" /></div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="grid grid-cols-2 gap-3">
-              {catalog.map(item => <ProductCard key={item.id} item={item} onPick={(it) => { setSelected(it); setTab('upload'); }} />)}
-            </div>
-          )}
-          <button onClick={share}
-            className="w-full mt-8 bg-bgSoft border border-border2 text-accent py-4 rounded-2xl text-xs font-medium uppercase tracking-wider2 flex items-center justify-center gap-2 active:scale-[0.98] transition">
-            <span>👥</span> Поделиться с подругой · +3
-          </button>
-        </main>
-      )}
-
-      {tab === 'search' && <SearchScreen catalog={catalog} onPick={(it) => { setSelected(it); setTab('upload'); }} />}
-
-      {tab === 'profile' && (
-        <ProfileScreen user={user}
-          onOpenSubs={() => setScreen('subs')}
-          onOpenBuyTries={() => setScreen('buyTries')}
-          onOpenHistory={() => setScreen('history')}
-          onToast={showToast} />
-      )}
-
-      {tab === 'upload' && selected && (
-        <main className="px-5 pt-5 animate-fade-in">
-          <button onClick={() => setTab('catalog')} className="text-xs text-muted mb-5 flex items-center gap-1 active:scale-95 transition">← Назад</button>
-          <div className="bg-card border border-border1 rounded-2xl overflow-hidden mb-6">
-            <div className="aspect-[4/3]">
-              <ProductImage src={selected.image_url} fallback={selected.fallback_url} alt={selected.name} className="w-full h-full" />
-            </div>
-            <div className="p-4">
-              <div className="text-[10px] uppercase tracking-wider2 text-accentSoft mb-1">{CATEGORIES.find(x => x.key === selected.category)?.label || 'Одежда'}</div>
-              <div className="font-serif text-base leading-tight text-title">{selected.description || selected.name}</div>
-              <div className="text-xs text-muted mt-1.5 flex items-center gap-1"><span className="text-accent">≈</span><span>{selected.price ? selected.price.replace(/^≈\s*/, '') : '—'}</span></div>
-            </div>
-          </div>
-          <div className="bg-card border border-border2 rounded-2xl p-4 mb-4">
-            <div className="text-[10px] uppercase tracking-wider2 text-accent mb-2">📸 {selected.category === 'accessory' ? 'Для аксессуаров' : 'Для одежды'}</div>
-            <div className="text-xs text-title leading-relaxed">
-              {selected.category === 'accessory'
-                ? 'Загрузите фото лица — очки, повязки и ободки будут примерены прямо на него.'
-                : 'Загрузите фото в полный рост — вещь будет примерена на вас.'}
-            </div>
-          </div>
-          <button onClick={() => fileRef.current?.click()}
-            className="w-full bg-card border border-dashed border-border2 hover:border-accentSoft rounded-2xl py-8 text-sm text-muted2 mb-3 flex flex-col items-center gap-2 active:scale-[0.99] transition">
-            <span className="text-2xl">{humanImg ? '✓' : '📷'}</span>
-            <span>{humanImg ? 'Фото загружено' : 'Загрузить фото'}</span>
-          </button>
-          <input ref={fileRef} type="file" accept="image/*" onChange={onPickFile} className="hidden" />
-          {humanImg && <img src={humanImg} alt="preview" className="w-full max-h-72 object-contain rounded-2xl mb-4 border border-border1 animate-fade-in" />}
-          <button onClick={runTryOn} disabled={!humanImg}
-            className="w-full bg-accent hover:bg-accentH disabled:opacity-30 disabled:cursor-not-allowed text-bg py-4 rounded-2xl text-sm font-medium uppercase tracking-wider2 mt-4 active:scale-[0.98] transition">
-            {selected.category === 'accessory' ? 'Примерить аксессуар' : 'Запустить примерку'}
-          </button>
-        </main>
-      )}
-
-      {tab === 'loading' && (
-        <div className="min-h-[75vh] flex flex-col items-center justify-center px-8 text-center">
-          <div className="spinner mb-8" />
-          <div className="font-serif text-xl mb-2">Подбираем образ</div>
-          <div className="text-xs text-muted transition-opacity duration-300">{HINTS[hintIdx]}</div>
-        </div>
-      )}
-
-      {tab === 'result' && (
-        <main className="px-5 pt-5 animate-fade-in">
-          <div className="text-[10px] uppercase tracking-wider2 text-muted mb-3">Результат</div>
-          {resultImage && resultImage.startsWith('http') ? (
-            <>
-              <img src={resultImage} alt="result"
-                className="w-full rounded-2xl border border-border1 shadow-soft mb-5"
-                onError={(e) => { e.target.src = 'https://placehold.co/600x800/1A1412/D4B595?text=Ошибка+загрузки'; }} />
-              <a href={`https://www.wildberries.ru/catalog/${selected?.wb_id}/detail.aspx`} target="_blank" rel="noreferrer"
-                className="block w-full bg-accent hover:bg-accentH text-bg text-center py-4 rounded-2xl text-sm font-medium uppercase tracking-wider2 mb-3 active:scale-[0.98] transition">
-                Купить на Wildberries
-              </a>
-            </>
-          ) : (
-            <div className="text-center py-16">
-              <div className="text-4xl mb-3">😕</div>
-              <div className="text-sm text-title mb-2">Не удалось сгенерировать фото</div>
-              <div className="text-xs text-muted mb-6">Попробуй другой товар или загрузи фото в полный рост</div>
-            </div>
-          )}
-          <button onClick={resetTryOn} className="w-full border border-border2 text-muted2 py-4 rounded-2xl text-sm active:scale-[0.98] transition">Вернуться в каталог</button>
-        </main>
-      )}
-
-      {viral && (
-        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-end sm:items-center justify-center p-5 animate-fade-in">
-          <div className="bg-card border border-border2 rounded-3xl p-7 max-w-sm w-full text-center shadow-soft animate-slide-up">
-            <div className="text-3xl mb-4">✨</div>
-            <h3 className="font-serif text-2xl mb-3">Понравилось?</h3>
-            <p className="text-xs text-muted2 leading-relaxed mb-6">Поделись с подругой — как только она сделает первую примерку, вы обе получите <span className="text-accent">+3 попытки</span></p>
-            <button onClick={() => { setViral(false); share(); }}
-              className="w-full bg-accent text-bg py-3.5 rounded-2xl text-xs font-medium uppercase tracking-wider2 mb-3 active:scale-[0.98] transition">Поделиться</button>
-            <button onClick={() => setViral(false)} className="text-xs text-muted">Закрыть</button>
-          </div>
-        </div>
-      )}
-
-      {!isTryOn && (
-        <BottomNav active={tab} onChange={(k) => { setScreen(null); setTab(k); if (k === 'subs') setScreen('subs'); }} />
-      )}
-    </div>
-  );
+      if (data?.name) return { wb_id: wbId, name: data.name, price: null };
+    } catch {}
+  }
+  return null;
 }
+function guessCategory(name) {
+  const n = (name || '').toLowerCase();
+  if (/(очки|оправа|повязк|ободок|заколк|шарф|бандана|сумк|ремень|браслет|серьг|цепочк)/.test(n)) return 'accessory';
+  if (/(пальто|тренч|пуховик|шуба|плащ|ветровка|бомбер|дубленка|кожанк|куртк|жилет)/.test(n)) return 'outerwear';
+  if (/(костюм|комплект)/.test(n)) return 'suit';
+  if (/(платье|сарафан|юбка)/.test(n)) return 'dress';
+  if (/(блузка|рубашк|топ|майка|футболка|боди|корсет|водолазк|поло|лонгслив|кроп|бандо|худи|свитер|кардиган|джемпер|кофт)/.test(n)) return 'top';
+  if (/(брюк|джинс|штан|лосины|леггинс|шорт|карго)/.test(n)) return 'bottom';
+  return 'top';
+}
+
+// ============================================================
+// AUTH
+// ============================================================
+app.post('/api/auth', async (req, res) => {
+  const { initData, refCode } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  const { id: tgId, first_name, username, photo_url } = tgUser;
+  try {
+    const existing = await pool.query('SELECT * FROM users WHERE tg_id = $1', [tgId]);
+    if (existing.rows.length === 0) {
+      let inviterId = null;
+      if (refCode?.startsWith('ref_')) {
+        const parsed = Number(refCode.replace('ref_', ''));
+        if (parsed && parsed !== tgId) {
+          const inv = await pool.query('SELECT tg_id FROM users WHERE tg_id = $1', [parsed]);
+          if (inv.rows.length) inviterId = parsed;
+        }
+      }
+      const ins = await pool.query(
+        `INSERT INTO users (tg_id, username, first_name, photo_url, balance, own_tries, sub_active, ref_by, last_active)
+         VALUES ($1,$2,$3,$4,3,0,FALSE,$5,NOW()) RETURNING *`,
+        [tgId, username || null, first_name || null, photo_url || null, inviterId]
+      );
+      return res.json({ success: true, user: ins.rows[0] });
+    }
+    const upd = await pool.query(
+      `UPDATE users SET first_name=$1, username=$2, photo_url=$3, last_active=NOW()
+       WHERE tg_id=$4 RETURNING *`,
+      [first_name || null, username || null, photo_url || null, tgId]
+    );
+    res.json({ success: true, user: upd.rows[0] });
+  } catch (e) {
+    console.error('[auth]', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ============================================================
+// IMG PROXY
+// ============================================================
+app.get('/api/img', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).send('Bad url');
+  let parsed;
+  try { parsed = new URL(url); } catch { return res.status(400).send('Bad url'); }
+  const okHosts = [/\.wbbasket\.ru$/, /\.wbstatic\.net$/, /\.geobasket\.ru$/, /^lh3\.googleusercontent\.com$/, /^drive\.google\.com$/];
+  if (!okHosts.some(rx => rx.test(parsed.hostname))) return res.status(400).send('Bad host');
+  try {
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' } });
+    if (!r.ok) return res.status(404).send('Not found');
+    const buf = await r.buffer();
+    res.set('Content-Type', r.headers.get('content-type') || 'image/webp');
+    res.set('Cache-Control', 'public, max-age=604800, immutable');
+    res.send(buf);
+  } catch { res.status(500).send('Proxy error'); }
+});
+
+// ============================================================
+// CATALOG
+// ============================================================
+app.get('/api/catalog', async (req, res) => {
+  try {
+    const { category, limit = 300, offset = 0 } = req.query;
+    const params = [];
+    let where = 'WHERE is_active = TRUE';
+    if (category && category !== 'all') { params.push(category); where += ` AND category = $${params.length}`; }
+    params.push(Number(limit), Number(offset));
+    const q = `
+      WITH ranked AS (
+        SELECT id, wb_id, name, price, category, image_url, fallback_url, description, is_pinned,
+          ROW_NUMBER() OVER (PARTITION BY category ORDER BY updated_at DESC, id DESC) AS rn
+        FROM products ${where}
+      )
+      SELECT id, wb_id, name, price, category, image_url, fallback_url, description
+      FROM ranked
+      ORDER BY is_pinned DESC NULLS LAST, rn ASC, MD5(category || id::text) ASC
+      LIMIT $${params.length - 1} OFFSET $${params.length}`;
+    const r = await pool.query(q, params);
+    res.json({ success: true, items: r.rows });
+  } catch (e) { console.error('[catalog]', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ============================================================
+// TRYON — ускоренный (одна модель, fast mode)
+// ============================================================
+const TRYON_MODEL = 'fal-ai/fashn/tryon/v1.6';
+
+app.post('/api/tryon', async (req, res) => {
+  const t0 = Date.now();
+  const { initData, humanImg, garmentUrl, itemId, isOwnProduct, category } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  const tgId = tgUser.id;
+
+  try {
+    const u = await pool.query('SELECT * FROM users WHERE tg_id = $1', [tgId]);
+    if (!u.rows.length) return res.status(404).json({ error: 'User not found' });
+    const user = u.rows[0];
+    const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
+
+    if (!hasUnlimited) {
+      if (isOwnProduct === true) {
+        if ((user.own_tries || 0) <= 0) return res.status(402).json({ error: 'Нет попыток для своих товаров' });
+        await pool.query('UPDATE users SET own_tries = own_tries - 1 WHERE tg_id = $1', [tgId]);
+      } else {
+        if (user.balance <= 0) return res.status(402).json({ error: 'Нет попыток' });
+        await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
+      }
+    }
+
+    let resultUrl = null, isMock = false, usedModel = null;
+
+    try {
+      console.log(`[tryon] trying ${TRYON_MODEL} (fast)...`);
+      const tFal = Date.now();
+      const r = await fal.subscribe(TRYON_MODEL, {
+        input: {
+          model_image: humanImg,
+          garment_image: garmentUrl,
+          category: category === 'accessory' ? 'accessories' : 'auto',
+          mode: 'performance',
+          acceleration: 'high',
+        },
+        logs: false,
+      });
+      resultUrl = r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
+      if (resultUrl) {
+        usedModel = 'fashn-fast';
+        console.log(`[tryon] OK fashn: ${Date.now() - tFal}ms (total ${Date.now() - t0}ms)`);
+      } else {
+        console.warn('[tryon] fashn no url');
+      }
+    } catch (e) {
+      console.warn(`[tryon] FAIL fashn: ${e.message}`);
+    }
+
+    if (!resultUrl) {
+      console.warn('[tryon] fallback → image-apps/v2');
+      try {
+        const r = await fal.subscribe('fal-ai/image-apps-v2/virtual-try-on', {
+          input: { person_image_url: humanImg, clothing_image_url: garmentUrl },
+          logs: false,
+        });
+        resultUrl = r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
+        if (resultUrl) usedModel = 'image-apps';
+      } catch (e) {
+        console.warn(`[tryon] FAIL image-apps: ${e.message}`);
+      }
+    }
+
+    if (!resultUrl) {
+      resultUrl = garmentUrl;
+      isMock = true;
+      console.warn('[tryon] all failed → mock');
+    }
+
+    const productSnap = itemId
+      ? await pool.query('SELECT wb_id, name, image_url FROM products WHERE id = $1', [itemId])
+      : { rows: [] };
+    const snap = productSnap.rows[0] || {};
+
+    await pool.query(
+      `INSERT INTO tryon_history
+         (user_id, product_id, product_wb_id, product_name, product_image, result_url, is_mock, category)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [tgId, itemId ? Number(itemId) : null, snap.wb_id || null, snap.name || null, snap.image_url || null, resultUrl, isMock, category || null]
+    );
+
+    if (!isMock && resultUrl) {
+      try {
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: tgId, photo: resultUrl, caption: '✨ Твоя примерка готова!' }),
+        });
+      } catch {}
+    }
+
+    if (user.ref_by && !user.ref_rewarded && !isMock) {
+      await pool.query('UPDATE users SET ref_rewarded = TRUE WHERE tg_id = $1', [tgId]);
+      await pool.query('UPDATE users SET balance = balance + 3 WHERE tg_id = $1', [user.ref_by]);
+      sendMessage(user.ref_by, '🎉 Твоя подруга сделала первую примерку! +3 попытки ✨').catch(() => {});
+    }
+
+    res.json({ success: true, resultUrl, isMock, usedModel, took: Date.now() - t0 });
+  } catch (e) {
+    console.error('[tryon]', e.message);
+    res.json({ success: false, error: 'Ошибка генерации' });
+  }
+});
+
+// ============================================================
+// HISTORY
+// ============================================================
+app.post('/api/history', async (req, res) => {
+  const { initData } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const r = await pool.query(
+      `SELECT id, result_url, is_mock, created_at, category,
+              COALESCE(product_name, 'Товар') AS product_name,
+              product_wb_id, product_image
+       FROM tryon_history WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [tgUser.id]
+    );
+    res.json({ success: true, items: r.rows });
+  } catch { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ============================================================
+// PROMO
+// ============================================================
+app.post('/api/redeem-promo', async (req, res) => {
+  const { initData, code } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  const tgId = tgUser.id;
+  const cleanCode = String(code || '').trim().toUpperCase();
+  if (!cleanCode) return res.status(400).json({ error: 'Введите промокод' });
+  try {
+    const promo = await pool.query(
+      `SELECT * FROM promo_codes WHERE code = $1 AND is_active = TRUE AND (expires_at IS NULL OR expires_at > NOW())`,
+      [cleanCode]
+    );
+    if (!promo.rows.length) return res.status(404).json({ error: 'Промокод не найден' });
+    const p = promo.rows[0];
+    if (p.used_count >= p.max_uses) return res.status(400).json({ error: 'Промокод больше не действует' });
+    const used = await pool.query('SELECT 1 FROM promo_uses WHERE code = $1 AND tg_id = $2', [cleanCode, tgId]);
+    if (used.rows.length) return res.status(400).json({ error: 'Вы уже использовали этот промокод' });
+    await pool.query('INSERT INTO promo_uses (code, tg_id) VALUES ($1, $2)', [cleanCode, tgId]);
+    await pool.query('UPDATE promo_codes SET used_count = used_count + 1 WHERE code = $1', [cleanCode]);
+    if (p.unlimited) {
+      const until = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      await pool.query('UPDATE users SET unlimited_until = $1 WHERE tg_id = $2', [until, tgId]);
+      return res.json({ success: true, tries: 0, unlimited: true });
+    }
+    await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [p.tries, tgId]);
+    res.json({ success: true, tries: p.tries, unlimited: false });
+  } catch { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ============================================================
+// ONBOARDED
+// ============================================================
+app.post('/api/onboarded', async (req, res) => {
+  const { initData } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    await pool.query('UPDATE users SET onboarded = TRUE WHERE tg_id = $1', [tgUser.id]);
+    res.json({ success: true });
+  } catch { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ============================================================
+// INVOICE
+// ============================================================
+app.post('/api/create-invoice', async (req, res) => {
+  const { tgId, productType, tries } = req.body;
+  let title = '10 примерок одежды', amount = 50;
+  let payload = `pack10:${tgId}:${Date.now()}`;
+  if (SUBSCRIPTIONS[productType]) {
+    const sub = SUBSCRIPTIONS[productType];
+    title = sub.title; amount = sub.stars;
+    payload = `${productType}:${tgId}:${Date.now()}`;
+  } else if (productType === 'custom_tries') {
+    const n = Math.max(1, Math.min(500, Number(tries) || 1));
+    amount = n * 5; title = `${n} примерок`;
+    payload = `custom_tries:${tgId}:${n}:${Date.now()}`;
+  }
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/createInvoiceLink`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, description: 'Оплата цифровых услуг', payload, currency: 'XTR', prices: [{ label: title, amount }] }),
+    });
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.description);
+    res.json({ invoiceLink: data.result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ============================================================
+// АДМИН-ПАНЕЛЬ
+// ============================================================
+function mainAdminKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '📊 Статистика', callback_data: 'adm_stats' }],
+      [{ text: '👥 Пользователи', callback_data: 'adm_users' }],
+      [{ text: '🔍 Найти пользователя', callback_data: 'adm_find' }],
+      [{ text: '🎁 Промокоды', callback_data: 'adm_promo' }],
+      [{ text: '🛍 Товары', callback_data: 'adm_products' }],
+      [{ text: '📢 Рассылка', callback_data: 'adm_broadcast' }],
+      [{ text: '⚙️ Настройки', callback_data: 'adm_settings' }],
+      [{ text: '❓ Помощь', callback_data: 'adm_help' }],
+    ],
+  };
+}
+function productsMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '➕ Добавить по ссылкам WB', callback_data: 'adm_add_links' }],
+      [{ text: '✏️ Добавить вручную', callback_data: 'adm_add_manual' }],
+      [{ text: '📌 Закрепить товар', callback_data: 'adm_pin' }],
+      [{ text: '🙈 Скрыть товар', callback_data: 'adm_hide' }],
+      [{ text: '👁 Вернуть товар', callback_data: 'adm_unhide' }],
+      [{ text: '🗑 Удалить товар', callback_data: 'adm_delete' }],
+      [{ text: '🔄 Обновить названия', callback_data: 'adm_backfill' }],
+      [{ text: '🧹 Удалить товары старше 5 дней', callback_data: 'adm_cleanup' }],
+      [{ text: '← Назад', callback_data: 'adm_back' }],
+    ],
+  };
+}
+function promoMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '➕ Создать свой промокод', callback_data: 'adm_promo_custom' }],
+      [{ text: '⚡ Быстрый: +2 попытки', callback_data: 'adm_promo_quick_2' }],
+      [{ text: '⚡ Быстрый: +5 попыток', callback_data: 'adm_promo_quick_5' }],
+      [{ text: '⚡ Быстрый: +10 попыток', callback_data: 'adm_promo_quick_10' }],
+      [{ text: '⚡ Быстрый: +20 попыток', callback_data: 'adm_promo_quick_20' }],
+      [{ text: '♾ Быстрый: безлимит 24 часа', callback_data: 'adm_promo_quick_unlimited' }],
+      [{ text: '📋 Список промокодов', callback_data: 'adm_promo_list' }],
+      [{ text: '🗑 Удалить промокод', callback_data: 'adm_promo_delete' }],
+      [{ text: '← Назад', callback_data: 'adm_back' }],
+    ],
+  };
+}
+function usersMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '📋 Последние 20', callback_data: 'adm_users_last' }],
+      [{ text: '💰 Топ по балансу', callback_data: 'adm_users_top' }],
+      [{ text: '🆕 Новые за сутки', callback_data: 'adm_users_new' }],
+      [{ text: '🔍 Найти по имени / @username / ID', callback_data: 'adm_find' }],
+      [{ text: '← Назад', callback_data: 'adm_back' }],
+    ],
+  };
+}
+function userActionsKeyboard(tgId) {
+  return {
+    inline_keyboard: [
+      [{ text: '➕ +5 попыток', callback_data: `usr_add_5_${tgId}` }, { text: '➕ +10', callback_data: `usr_add_10_${tgId}` }],
+      [{ text: '➕ +25', callback_data: `usr_add_25_${tgId}` }, { text: '➕ +50', callback_data: `usr_add_50_${tgId}` }],
+      [{ text: '➕ Своё число', callback_data: `usr_add_custom_${tgId}` }],
+      [{ text: '🔄 Обнулить баланс', callback_data: `usr_reset_${tgId}` }],
+      [{ text: '♾ Безлимит 24ч', callback_data: `usr_unlimit_${tgId}` }, { text: '❌ Снять', callback_data: `usr_unlimit_off_${tgId}` }],
+      [{ text: '💎 Сделать админом', callback_data: `usr_admin_on_${tgId}` }, { text: '❌ Снять админа', callback_data: `usr_admin_off_${tgId}` }],
+      [{ text: '📩 Написать юзеру', callback_data: `usr_dm_${tgId}` }],
+      [{ text: '🗑 Удалить', callback_data: `usr_delete_${tgId}` }],
+      [{ text: '← К юзерам', callback_data: 'adm_users' }],
+    ],
+  };
+}
+
+const awaitingBroadcast = new Set();
+const awaitingUserSearch = new Set();
+const awaitingAddCustom = new Map();
+const awaitingLinks = new Set();
+const awaitingLinksDesc = new Map();
+const awaitingManualProduct = new Map();
+const awaitingPromoCustom = new Map();
+const awaitingProductAction = new Map();
+const awaitingDM = new Map();
+
+function randomCode(len = 6) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let s = '';
+  for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
+async function handleStart(msg) {
+  const chatId = msg.chat.id;
+  if (await isAdmin(msg.from.id)) {
+    await sendMessage(chatId, '👑 <b>Админ-панель Style Room</b>\n\nВыбери раздел:', mainAdminKeyboard());
+  } else {
+    await sendMessage(chatId, '✨ Добро пожаловать в Style Room!\n\nНажми кнопку ниже, чтобы открыть приложение.');
+  }
+}
+async function handleAdminMenu(msg) {
+  if (!(await isAdmin(msg.from.id))) return sendMessage(msg.chat.id, '⛔ Нет доступа.');
+  await sendMessage(msg.chat.id, '👑 <b>Админ-панель</b>\n\nВыбери раздел:', mainAdminKeyboard());
+}
+
+async function handleCallback(cb) {
+  const chatId = cb.message.chat.id;
+  const messageId = cb.message.message_id;
+  const data = cb.data;
+  const userId = cb.from.id;
+
+  if (!(await isAdmin(userId))) return answerCallback(cb.id, '⛔ Нет доступа');
+  await answerCallback(cb.id);
+
+  const back = () => editMessage(chatId, messageId, '👑 <b>Админ-панель</b>\n\nВыбери раздел:', mainAdminKeyboard());
+  const backKb = { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]] };
+
+  if (data === 'adm_back') return back();
+
+  if (data === 'adm_help') {
+    return editMessage(chatId, messageId,
+      `❓ <b>Помощь</b>\n\n` +
+      `<b>📊 Статистика</b> — юзеры, примерки, платежи.\n\n` +
+      `<b>👥 Пользователи</b> — список, карточка юзера с действиями.\n\n` +
+      `<b>🔍 Найти</b> — по имени, @username или ID.\n\n` +
+      `<b>🎁 Промокоды</b> — быстрые (+2/+5/+10/+20/безлимит) или свой код с любым текстом.\n\n` +
+      `<b>🛍 Товары</b> — добавлять по ссылке WB, закрепить/скрыть/удалить.\n\n` +
+      `<b>📢 Рассылка</b> — отправить сообщение всем.\n\n` +
+      `<b>⚙️ Настройки</b> — список админов.`,
+      backKb);
+  }
+
+  if (data === 'adm_stats') {
+    const users = await pool.query('SELECT COUNT(*)::int AS c, COALESCE(SUM(balance),0)::int AS b FROM users');
+    const today = await pool.query(`SELECT COUNT(*)::int AS c FROM users WHERE created_at > NOW() - INTERVAL '1 day'`);
+    const tryons = await pool.query('SELECT COUNT(*)::int AS c FROM tryon_history');
+    const products = await pool.query('SELECT COUNT(*)::int AS c FROM products WHERE is_active = TRUE');
+    const payments = await pool.query('SELECT COUNT(*)::int AS c, COALESCE(SUM(stars),0)::int AS s FROM payments');
+    return editMessage(chatId, messageId,
+      `📊 <b>Статистика</b>\n\n👥 Юзеров: <b>${users.rows[0].c}</b>\n🆕 За сутки: <b>${today.rows[0].c}</b>\n` +
+      `✨ Примерок: <b>${tryons.rows[0].c}</b>\n🛍 Товаров: <b>${products.rows[0].c}</b>\n` +
+      `💳 Платежей: <b>${payments.rows[0].c}</b>\n⭐️ Звёзд: <b>${payments.rows[0].s}</b>\n💎 Сумма балансов: <b>${users.rows[0].b}</b>`,
+      backKb);
+  }
+
+  if (data === 'adm_users') return editMessage(chatId, messageId, '👥 <b>Пользователи</b>', usersMenuKeyboard());
+
+  if (data === 'adm_users_last') {
+    const r = await pool.query(`SELECT tg_id, first_name, balance FROM users ORDER BY created_at DESC LIMIT 20`);
+    if (!r.rows.length) return editMessage(chatId, messageId, '👥 Пусто.', { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_users' }]] });
+    const btns = r.rows.map(u => [{ text: `${u.first_name || '—'} · ✨${u.balance}`, callback_data: `usr_show_${u.tg_id}` }]);
+    btns.push([{ text: '← Назад', callback_data: 'adm_users' }]);
+    return editMessage(chatId, messageId, '👥 <b>Последние 20:</b>', { inline_keyboard: btns });
+  }
+  if (data === 'adm_users_top') {
+    const r = await pool.query(`SELECT tg_id, first_name, balance FROM users ORDER BY balance DESC LIMIT 20`);
+    const btns = r.rows.map(u => [{ text: `${u.first_name || '—'} · ✨${u.balance}`, callback_data: `usr_show_${u.tg_id}` }]);
+    btns.push([{ text: '← Назад', callback_data: 'adm_users' }]);
+    return editMessage(chatId, messageId, '💰 <b>Топ по балансу:</b>', { inline_keyboard: btns });
+  }
+  if (data === 'adm_users_new') {
+    const r = await pool.query(`SELECT tg_id, first_name, balance FROM users WHERE created_at > NOW() - INTERVAL '1 day' ORDER BY created_at DESC LIMIT 20`);
+    if (!r.rows.length) return editMessage(chatId, messageId, '🆕 Новых нет.', { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_users' }]] });
+    const btns = r.rows.map(u => [{ text: `${u.first_name || '—'} · ✨${u.balance}`, callback_data: `usr_show_${u.tg_id}` }]);
+    btns.push([{ text: '← Назад', callback_data: 'adm_users' }]);
+    return editMessage(chatId, messageId, '🆕 <b>Новые за сутки:</b>', { inline_keyboard: btns });
+  }
+  if (data === 'adm_find') {
+    awaitingUserSearch.add(userId);
+    return editMessage(chatId, messageId, '🔍 Пришли имя, @username или ID одним сообщением.', { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_back' }]] });
+  }
+
+  if (data.startsWith('usr_show_')) return showUserCard(chatId, messageId, Number(data.replace('usr_show_', '')));
+  if (data.startsWith('usr_add_custom_')) {
+    const tgId = Number(data.replace('usr_add_custom_', ''));
+    awaitingAddCustom.set(userId, tgId);
+    return editMessage(chatId, messageId, '➕ Введи число примерок (можно отрицательное):', { inline_keyboard: [[{ text: '❌ Отмена', callback_data: `usr_show_${tgId}` }]] });
+  }
+  if (/^usr_add_\d+_\d+$/.test(data)) {
+    const [, , count, tgId] = data.split('_');
+    await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [Number(count), Number(tgId)]);
+    return showUserCard(chatId, messageId, Number(tgId), `Начислено +${count}`);
+  }
+  if (data.startsWith('usr_reset_')) {
+    const tgId = Number(data.replace('usr_reset_', ''));
+    await pool.query('UPDATE users SET balance = 0 WHERE tg_id = $1', [tgId]);
+    return showUserCard(chatId, messageId, tgId, 'Баланс обнулён');
+  }
+  if (data.startsWith('usr_unlimit_off_')) {
+    const tgId = Number(data.replace('usr_unlimit_off_', ''));
+    await pool.query('UPDATE users SET unlimited_until = NULL WHERE tg_id = $1', [tgId]);
+    return showUserCard(chatId, messageId, tgId, 'Безлимит снят');
+  }
+  if (data.startsWith('usr_unlimit_')) {
+    const tgId = Number(data.replace('usr_unlimit_', ''));
+    await pool.query('UPDATE users SET unlimited_until = $1 WHERE tg_id = $2', [new Date(Date.now() + 86400000), tgId]);
+    return showUserCard(chatId, messageId, tgId, 'Безлимит 24ч выдан');
+  }
+  if (data.startsWith('usr_admin_on_')) {
+    const tgId = Number(data.replace('usr_admin_on_', ''));
+    await pool.query('UPDATE users SET is_admin = TRUE WHERE tg_id = $1', [tgId]);
+    return showUserCard(chatId, messageId, tgId, '👑 Теперь админ');
+  }
+  if (data.startsWith('usr_admin_off_')) {
+    const tgId = Number(data.replace('usr_admin_off_', ''));
+    await pool.query('UPDATE users SET is_admin = FALSE WHERE tg_id = $1', [tgId]);
+    return showUserCard(chatId, messageId, tgId, 'Больше не админ');
+  }
+  if (data.startsWith('usr_dm_')) {
+    const tgId = Number(data.replace('usr_dm_', ''));
+    awaitingDM.set(userId, tgId);
+    return editMessage(chatId, messageId, `📩 Напиши текст для <code>${tgId}</code>:`, { inline_keyboard: [[{ text: '❌ Отмена', callback_data: `usr_show_${tgId}` }]] });
+  }
+  if (data.startsWith('usr_delete_')) {
+    const tgId = Number(data.replace('usr_delete_', ''));
+    await pool.query('DELETE FROM users WHERE tg_id = $1', [tgId]);
+    return editMessage(chatId, messageId, `🗑 Юзер удалён.`, { inline_keyboard: [[{ text: '← К юзерам', callback_data: 'adm_users' }]] });
+  }
+
+  if (data === 'adm_products') return editMessage(chatId, messageId, '🛍 <b>Товары</b>', productsMenuKeyboard());
+  if (data === 'adm_add_links') {
+    awaitingLinks.add(userId);
+    return editMessage(chatId, messageId, '➕ Пришли ссылки Wildberries одним сообщением (можно несколько):', { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_products' }]] });
+  }
+  if (data === 'adm_add_manual') {
+    awaitingManualProduct.set(userId, { step: 'wb_id' });
+    return editMessage(chatId, messageId, '✏️ Шаг 1/5: пришли <b>ссылку WB</b> на товар.', { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_products' }]] });
+  }
+  if (['adm_pin', 'adm_hide', 'adm_unhide', 'adm_delete'].includes(data)) {
+    const action = data.replace('adm_', '');
+    awaitingProductAction.set(userId, action);
+    const prompts = {
+      pin: '📌 Пришли ссылку WB товара для закрепления:',
+      hide: '🙈 Пришли ссылку WB товара, чтобы скрыть:',
+      unhide: '👁 Пришли ссылку WB товара, чтобы вернуть:',
+      delete: '🗑 Пришли ссылку WB товара для удаления:',
+    };
+    return editMessage(chatId, messageId, prompts[action], { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_products' }]] });
+  }
+  if (data === 'adm_backfill') {
+    return editMessage(chatId, messageId, '🔄 Обновляю названия…', backKb).then(async () => {
+      try {
+        const r = await pool.query(`SELECT id, wb_id FROM products WHERE name LIKE 'Товар WB%' OR name IS NULL OR name = '' ORDER BY id DESC LIMIT 200`);
+        let updated = 0, failed = 0;
+        for (const row of r.rows) {
+          const info = await fetchWBProductInfo(row.wb_id);
+          if (info?.name && !info.name.startsWith('Товар WB')) {
+            await pool.query(`UPDATE products SET name=$1, price=COALESCE($2, price), updated_at=NOW() WHERE id=$3`, [info.name, info.price, row.id]);
+            updated++;
+          } else failed++;
+          await new Promise(rs => setTimeout(rs, 250));
+        }
+        await sendMessage(chatId, `✅ Обновлено: <b>${updated}</b>\nНе удалось: <b>${failed}</b>`, backKb);
+      } catch (e) { await sendMessage(chatId, '❌ ' + e.message, backKb); }
+    });
+  }
+  if (data === 'adm_cleanup') {
+    try {
+      const r = await pool.query('SELECT deleted_count FROM cleanup_old_products()');
+      return editMessage(chatId, messageId, `🧹 Удалено: <b>${r.rows[0].deleted_count}</b>`, backKb);
+    } catch (e) { return editMessage(chatId, messageId, '❌ ' + e.message, backKb); }
+  }
+
+  if (data === 'adm_promo') return editMessage(chatId, messageId, '🎁 <b>Промокоды</b>', promoMenuKeyboard());
+  if (data === 'adm_promo_custom') {
+    awaitingPromoCustom.set(userId, { step: 'code' });
+    return editMessage(chatId, messageId, '🎁 <b>Свой промокод</b>\n\nШаг 1/3: введи <b>код</b> (латиница/цифры, до 20 символов). Например: <code>SALE10</code>', { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_promo' }]] });
+  }
+  if (data.startsWith('adm_promo_quick_')) {
+    const type = data.replace('adm_promo_quick_', '');
+    const code = randomCode();
+    let tries = 0, unlimited = false;
+    if (type === 'unlimited') unlimited = true; else tries = Number(type);
+    await pool.query(
+      `INSERT INTO promo_codes (code, tries, unlimited, max_uses, is_active, label) VALUES ($1, $2, $3, 1000, TRUE, $4)`,
+      [code, tries, unlimited, unlimited ? 'Безлимит 24ч' : `+${tries} попыток`]
+    );
+    return editMessage(chatId, messageId, `✅ <b>Промокод создан</b>\n\n🔑 Код: <code>${code}</code>\n🎁 ${unlimited ? 'Безлимит 24 часа' : `+${tries} попыток`}\n📊 Лимит: 1000 активаций`, { inline_keyboard: [[{ text: '🎁 Промокоды', callback_data: 'adm_promo' }]] });
+  }
+  if (data === 'adm_promo_list') {
+    const r = await pool.query(`SELECT code, tries, unlimited, used_count, max_uses, is_active FROM promo_codes ORDER BY created_at DESC LIMIT 20`);
+    if (!r.rows.length) return editMessage(chatId, messageId, '📋 Промокодов нет.', { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_promo' }]] });
+    let m = '📋 <b>Промокоды:</b>\n\n';
+    for (const p of r.rows) m += `<code>${p.code}</code> · ${p.unlimited ? '💎' : '+' + p.tries} · ${p.used_count}/${p.max_uses}${p.is_active ? '' : ' · ⛔'}\n`;
+    return editMessage(chatId, messageId, m, { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_promo' }]] });
+  }
+  if (data === 'adm_promo_delete') {
+    const r = await pool.query(`SELECT code FROM promo_codes WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 10`);
+    if (!r.rows.length) return editMessage(chatId, messageId, '❌ Активных нет.', { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_promo' }]] });
+    const btns = r.rows.map(p => [{ text: '❌ ' + p.code, callback_data: 'adm_promodel_' + p.code }]);
+    btns.push([{ text: '← Назад', callback_data: 'adm_promo' }]);
+    return editMessage(chatId, messageId, 'Выбери промокод для деактивации:', { inline_keyboard: btns });
+  }
+  if (data.startsWith('adm_promodel_')) {
+    const code = data.replace('adm_promodel_', '');
+    await pool.query('UPDATE promo_codes SET is_active = FALSE WHERE code = $1', [code]);
+    return editMessage(chatId, messageId, `✅ Промокод <code>${code}</code> деактивирован.`, { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_promo' }]] });
+  }
+
+  if (data === 'adm_broadcast') {
+    awaitingBroadcast.add(userId);
+    return editMessage(chatId, messageId, '📢 Напиши текст рассылки:', { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_back' }]] });
+  }
+
+  if (data === 'adm_settings') {
+    const admins = await pool.query(`SELECT tg_id, first_name, username FROM users WHERE is_admin = TRUE ORDER BY created_at`);
+    let m = '⚙️ <b>Настройки</b>\n\n👑 <b>Администраторы:</b>\n';
+    for (const a of admins.rows) m += `• ${a.first_name || '—'} @${a.username || '—'} · <code>${a.tg_id}</code>\n`;
+    return editMessage(chatId, messageId, m, { inline_keyboard: [[{ text: '👥 Управлять админами', callback_data: 'adm_users' }], [{ text: '← Назад', callback_data: 'adm_back' }]] });
+  }
+}
+
+async function showUserCard(chatId, messageId, tgId, toast = null) {
+  try {
+    const r = await pool.query(
+      `SELECT tg_id, first_name, username, balance, own_tries, sub_active, unlimited_until, is_admin, created_at, last_active,
+              (SELECT COUNT(*)::int FROM tryon_history WHERE user_id = users.tg_id) AS total_tryons,
+              (SELECT COUNT(*)::int FROM payments WHERE tg_id = users.tg_id) AS payments
+       FROM users WHERE tg_id = $1`, [tgId]
+    );
+    if (!r.rows.length) {
+      const txt = `❌ Юзер <code>${tgId}</code> не найден.`;
+      return messageId ? editMessage(chatId, messageId, txt, { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_users' }]] })
+                       : sendMessage(chatId, txt, { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_users' }]] });
+    }
+    const u = r.rows[0];
+    const unlimText = u.unlimited_until && new Date(u.unlimited_until) > new Date()
+      ? `♾ до ${new Date(u.unlimited_until).toLocaleString('ru-RU')}` : 'нет';
+    const text =
+      `${toast ? '✅ ' + toast + '\n\n' : ''}` +
+      `👤 <b>${u.first_name || 'Без имени'}</b>\n🔗 @${u.username || '—'}\n🆔 <code>${u.tg_id}</code>${u.is_admin ? '\n👑 админ' : ''}\n\n` +
+      `✨ Обычных: <b>${u.balance}</b>\n📦 Своих: <b>${u.own_tries}</b>\n🎨 Примерок: <b>${u.total_tryons}</b>\n💳 Платежей: <b>${u.payments}</b>\n\n` +
+      `💎 Подписка: ${u.sub_active ? 'да' : 'нет'}\n♾ Безлимит: ${unlimText}\n` +
+      `📅 Создан: ${new Date(u.created_at).toLocaleDateString('ru-RU')}\n🕐 Был: ${u.last_active ? new Date(u.last_active).toLocaleString('ru-RU') : '—'}`;
+    const kb = userActionsKeyboard(tgId);
+    return messageId ? editMessage(chatId, messageId, text, kb) : sendMessage(chatId, text, kb);
+  } catch (e) {
+    const txt = '❌ Ошибка: ' + e.message;
+    return messageId ? editMessage(chatId, messageId, txt) : sendMessage(chatId, txt);
+  }
+}
+
+// ============================================================
+// TEXT HANDLERS
+// ============================================================
+async function handleBroadcastText(msg) {
+  if (!awaitingBroadcast.has(msg.from.id)) return false;
+  awaitingBroadcast.delete(msg.from.id);
+  const r = await pool.query('SELECT tg_id FROM users');
+  let sent = 0, fail = 0;
+  for (const u of r.rows) {
+    try { await sendMessage(u.tg_id, msg.text); sent++; if (sent % 25 === 0) await new Promise(rs => setTimeout(rs, 1000)); } catch { fail++; }
+  }
+  await sendMessage(msg.chat.id, `✅ Отправлено: <b>${sent}</b>, ошибок: <b>${fail}</b>`, mainAdminKeyboard());
+  return true;
+}
+async function handleUserSearch(msg) {
+  if (!awaitingUserSearch.has(msg.from.id)) return false;
+  awaitingUserSearch.delete(msg.from.id);
+  const q = msg.text.trim();
+  try {
+    let r;
+    if (/^\d+$/.test(q)) r = await pool.query('SELECT tg_id FROM users WHERE tg_id = $1', [Number(q)]);
+    else if (q.startsWith('@')) r = await pool.query('SELECT tg_id FROM users WHERE LOWER(username) = LOWER($1)', [q.slice(1)]);
+    else r = await pool.query('SELECT tg_id FROM users WHERE LOWER(first_name) LIKE LOWER($1) OR LOWER(username) LIKE LOWER($1) LIMIT 20', [`%${q}%`]);
+    if (!r.rows.length) return sendMessage(msg.chat.id, `❌ Никого не найдено по «${q}»`, mainAdminKeyboard()) && true;
+    if (r.rows.length === 1) return showUserCard(msg.chat.id, null, r.rows[0].tg_id, `Найден по «${q}»`);
+    const btns = r.rows.map(u => [{ text: `ID ${u.tg_id}`, callback_data: `usr_show_${u.tg_id}` }]);
+    btns.push([{ text: '← Назад', callback_data: 'adm_users' }]);
+    await sendMessage(msg.chat.id, `🔍 Найдено ${r.rows.length}:`, { inline_keyboard: btns });
+    return true;
+  } catch (e) { await sendMessage(msg.chat.id, '❌ ' + e.message, mainAdminKeyboard()); return true; }
+}
+async function handleAddCustomText(msg) {
+  if (!awaitingAddCustom.has(msg.from.id)) return false;
+  const targetTgId = awaitingAddCustom.get(msg.from.id);
+  awaitingAddCustom.delete(msg.from.id);
+  const n = Number(msg.text.trim());
+  if (!Number.isFinite(n) || n === 0) { await sendMessage(msg.chat.id, '❌ Введи число.'); return true; }
+  await pool.query('UPDATE users SET balance = GREATEST(0, balance + $1) WHERE tg_id = $2', [n, targetTgId]);
+  await showUserCard(msg.chat.id, null, targetTgId, `${n > 0 ? 'Начислено +' : 'Списано '}${n}`);
+  return true;
+}
+async function handleDM(msg) {
+  if (!awaitingDM.has(msg.from.id)) return false;
+  const targetTgId = awaitingDM.get(msg.from.id);
+  awaitingDM.delete(msg.from.id);
+  try {
+    await sendMessage(targetTgId, `📩 <b>Сообщение от админа:</b>\n\n${msg.text}`);
+    await sendMessage(msg.chat.id, '✅ Доставлено.', mainAdminKeyboard());
+  } catch (e) { await sendMessage(msg.chat.id, '❌ ' + e.message, mainAdminKeyboard()); }
+  return true;
+}
+async function handleLinksText(msg) {
+  if (!awaitingLinks.has(msg.from.id)) return false;
+  awaitingLinks.delete(msg.from.id);
+  const ids = extractWbIds(msg.text);
+  if (!ids.length) { await sendMessage(msg.chat.id, '❌ Не нашёл ссылок. Пример: <code>https://www.wildberries.ru/catalog/183581368/detail.aspx</code>', mainAdminKeyboard()); return true; }
+  awaitingLinksDesc.set(msg.from.id, ids);
+  await sendMessage(msg.chat.id, `📝 Введи <b>описание</b> для ${ids.length} товаров (или <code>-</code>):`, { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_products' }]] });
+  return true;
+}
+async function handleLinksDescText(msg) {
+  if (!awaitingLinksDesc.has(msg.from.id)) return false;
+  const ids = awaitingLinksDesc.get(msg.from.id);
+  awaitingLinksDesc.delete(msg.from.id);
+  const description = msg.text.trim() === '-' ? null : msg.text.trim();
+  await sendMessage(msg.chat.id, `⏳ Обрабатываю ${ids.length} товаров…`);
+  let added = 0, failed = 0;
+  for (const wbId of ids) {
+    try {
+      const info = await fetchWBProductInfo(wbId);
+      const name = info?.name || `Товар ${wbId}`;
+      const price = info?.price || null;
+      const category = guessCategory(name);
+      await pool.query(
+        `INSERT INTO products (wb_id, name, price, category, image_url, fallback_url, is_active, source, description, updated_at, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,TRUE,'manual',$7,NOW(),NOW())
+         ON CONFLICT (wb_id) DO UPDATE SET name=EXCLUDED.name, price=EXCLUDED.price, category=EXCLUDED.category,
+           image_url=EXCLUDED.image_url, fallback_url=EXCLUDED.fallback_url, is_active=TRUE, description=EXCLUDED.description, updated_at=NOW()`,
+        [wbId, name, price, category, primaryImageUrl(wbId), fallbackImageUrl(wbId), description]
+      );
+      added++;
+    } catch { failed++; }
+  }
+  await sendMessage(msg.chat.id, `✅ Добавлено: <b>${added}</b>\n❌ Ошибок: <b>${failed}</b>`, mainAdminKeyboard());
+  return true;
+}
+async function handleManualProductText(msg) {
+  if (!awaitingManualProduct.has(msg.from.id)) return false;
+  const state = awaitingManualProduct.get(msg.from.id);
+  const text = msg.text.trim();
+  if (state.step === 'wb_id') {
+    const ids = extractWbIds(text);
+    if (!ids.length) { await sendMessage(msg.chat.id, '❌ Не нашёл ссылку.'); return true; }
+    state.wb_id = ids[0]; state.step = 'name';
+    awaitingManualProduct.set(msg.from.id, state);
+    await sendMessage(msg.chat.id, 'Шаг 2/5: введи <b>название</b>.');
+    return true;
+  }
+  if (state.step === 'name') { state.name = text; state.step = 'price'; awaitingManualProduct.set(msg.from.id, state); await sendMessage(msg.chat.id, 'Шаг 3/5: введи <b>цену</b>.'); return true; }
+  if (state.step === 'price') { state.price = text; state.step = 'category'; awaitingManualProduct.set(msg.from.id, state); await sendMessage(msg.chat.id, 'Шаг 4/5: <b>категория</b>:\n<code>top</code> верх\n<code>bottom</code> низ\n<code>outerwear</code> верхняя\n<code>suit</code> костюмы\n<code>dress</code> платья\n<code>accessory</code> аксессуары'); return true; }
+  if (state.step === 'category') {
+    const allowed = ['top', 'bottom', 'outerwear', 'suit', 'dress', 'accessory'];
+    const cat = text.toLowerCase().trim();
+    if (!allowed.includes(cat)) { await sendMessage(msg.chat.id, `❌ Неверно. Допустимо: ${allowed.join(', ')}`); return true; }
+    state.category = cat; state.step = 'description';
+    awaitingManualProduct.set(msg.from.id, state);
+    await sendMessage(msg.chat.id, 'Шаг 5/5: введи <b>описание</b> (или <code>-</code>).');
+    return true;
+  }
+  if (state.step === 'description') {
+    state.description = text === '-' ? null : text;
+    awaitingManualProduct.delete(msg.from.id);
+    try {
+      await pool.query(
+        `INSERT INTO products (wb_id, name, price, category, image_url, fallback_url, is_active, source, description, updated_at, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,TRUE,'manual',$7,NOW(),NOW())
+         ON CONFLICT (wb_id) DO UPDATE SET name=EXCLUDED.name, price=EXCLUDED.price, category=EXCLUDED.category,
+           image_url=EXCLUDED.image_url, fallback_url=EXCLUDED.fallback_url, is_active=TRUE, description=EXCLUDED.description, updated_at=NOW()`,
+        [state.wb_id, state.name, state.price, state.category, primaryImageUrl(state.wb_id), fallbackImageUrl(state.wb_id), state.description]
+      );
+      await sendMessage(msg.chat.id, `✅ Товар добавлен!\n\n📝 ${state.name}\n💰 ${state.price || '—'}\n📂 ${state.category}\n📄 ${state.description || '—'}`, mainAdminKeyboard());
+    } catch (e) { await sendMessage(msg.chat.id, '❌ ' + e.message, mainAdminKeyboard()); }
+    return true;
+  }
+}
+async function handleProductAction(msg) {
+  if (!awaitingProductAction.has(msg.from.id)) return false;
+  const action = awaitingProductAction.get(msg.from.id);
+  const ids = extractWbIds(msg.text);
+  if (!ids.length) { await sendMessage(msg.chat.id, '❌ Не нашёл ссылку.'); return true; }
+  awaitingProductAction.delete(msg.from.id);
+  const wbId = ids[0];
+  try {
+    const exists = await pool.query('SELECT name FROM products WHERE wb_id = $1', [wbId]);
+    if (!exists.rows.length) { await sendMessage(msg.chat.id, `❌ Товар <code>${wbId}</code> не найден.`, mainAdminKeyboard()); return true; }
+    if (action === 'pin') await pool.query('UPDATE products SET is_pinned = TRUE WHERE wb_id = $1', [wbId]);
+    if (action === 'hide') await pool.query('UPDATE products SET is_active = FALSE WHERE wb_id = $1', [wbId]);
+    if (action === 'unhide') await pool.query('UPDATE products SET is_active = TRUE, is_pinned = FALSE WHERE wb_id = $1', [wbId]);
+    if (action === 'delete') await pool.query('DELETE FROM products WHERE wb_id = $1', [wbId]);
+    await sendMessage(msg.chat.id, `✅ ${action === 'delete' ? 'Удалён' : 'Готово'}: <b>${exists.rows[0].name}</b>`, mainAdminKeyboard());
+    return true;
+  } catch (e) { await sendMessage(msg.chat.id, '❌ ' + e.message, mainAdminKeyboard()); return true; }
+}
+async function handlePromoCustom(msg) {
+  if (!awaitingPromoCustom.has(msg.from.id)) return false;
+  const state = awaitingPromoCustom.get(msg.from.id);
+  const text = msg.text.trim();
+  if (state.step === 'code') {
+    const code = text.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 20);
+    if (!code) { await sendMessage(msg.chat.id, '❌ Код пустой.'); return true; }
+    const dup = await pool.query('SELECT 1 FROM promo_codes WHERE code = $1', [code]);
+    if (dup.rows.length) { await sendMessage(msg.chat.id, '❌ Такой код уже есть.'); return true; }
+    state.code = code; state.step = 'tries';
+    awaitingPromoCustom.set(msg.from.id, state);
+    await sendMessage(msg.chat.id, 'Шаг 2/3: <b>количество попыток</b>, или <code>unlimited</code> для безлимита 24ч.');
+    return true;
+  }
+  if (state.step === 'tries') {
+    let tries = 0, unlimited = false;
+    if (text.toLowerCase() === 'unlimited') unlimited = true;
+    else { tries = Number(text); if (!Number.isFinite(tries) || tries <= 0) { await sendMessage(msg.chat.id, '❌ Введи число > 0.'); return true; } }
+    state.tries = tries; state.unlimited = unlimited; state.step = 'max_uses';
+    awaitingPromoCustom.set(msg.from.id, state);
+    await sendMessage(msg.chat.id, 'Шаг 3/3: <b>лимит активаций</b> (или <code>0</code> для безлимита).');
+    return true;
+  }
+  if (state.step === 'max_uses') {
+    const maxUses = Number(text);
+    if (!Number.isFinite(maxUses) || maxUses < 0) { await sendMessage(msg.chat.id, '❌ Введи число ≥ 0.'); return true; }
+    try {
+      await pool.query(
+        `INSERT INTO promo_codes (code, tries, unlimited, max_uses, is_active, label) VALUES ($1, $2, $3, $4, TRUE, $5)`,
+        [state.code, state.tries, state.unlimited, maxUses === 0 ? 999999 : maxUses, state.unlimited ? 'Безлимит 24ч' : `+${state.tries} попыток`]
+      );
+      awaitingPromoCustom.delete(msg.from.id);
+      await sendMessage(msg.chat.id,
+        `✅ <b>Промокод создан</b>\n\n🔑 Код: <code>${state.code}</code>\n🎁 ${state.unlimited ? 'Безлимит 24ч' : `+${state.tries} попыток`}\n📊 Лимит: ${maxUses === 0 ? '∞' : maxUses}`,
+        { inline_keyboard: [[{ text: '🎁 К промокодам', callback_data: 'adm_promo' }]] });
+    } catch (e) { await sendMessage(msg.chat.id, '❌ ' + e.message, mainAdminKeyboard()); }
+    return true;
+  }
+}
+
+// ============================================================
+// WEBHOOK
+// ============================================================
+app.post('/api/webhook/telegram', async (req, res) => {
+  const update = req.body;
+  if (update.pre_checkout_query) {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerPreCheckoutQuery`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pre_checkout_query_id: update.pre_checkout_query.id, ok: true }),
+    });
+    return res.sendStatus(200);
+  }
+  if (update.callback_query) {
+    try { await handleCallback(update.callback_query); } catch (e) { console.error('[cb]', e.message); }
+    return res.sendStatus(200);
+  }
+  if (update.message?.text) {
+    const text = update.message.text.trim();
+    if (await handleBroadcastText(update.message).catch(() => false)) return res.sendStatus(200);
+    if (await handleUserSearch(update.message).catch(() => false)) return res.sendStatus(200);
+    if (await handleAddCustomText(update.message).catch(() => false)) return res.sendStatus(200);
+    if (await handleDM(update.message).catch(() => false)) return res.sendStatus(200);
+    if (await handleLinksDescText(update.message).catch(() => false)) return res.sendStatus(200);
+    if (await handleLinksText(update.message).catch(() => false)) return res.sendStatus(200);
+    if (await handleManualProductText(update.message).catch(() => false)) return res.sendStatus(200);
+    if (await handleProductAction(update.message).catch(() => false)) return res.sendStatus(200);
+    if (await handlePromoCustom(update.message).catch(() => false)) return res.sendStatus(200);
+    if (text === '/start') { await handleStart(update.message); return res.sendStatus(200); }
+    if (text === '/admin' || text === '/menu') { await handleAdminMenu(update.message); return res.sendStatus(200); }
+    return res.sendStatus(200);
+  }
+  if (update.message?.successful_payment) {
+    const pay = update.message.successful_payment;
+    const parts = (pay.invoice_payload || '').split(':');
+    const productType = parts[0];
+    const tgId = Number(parts[1]);
+    const chargeId = pay.telegram_payment_charge_id;
+    try {
+      const dup = await pool.query('SELECT 1 FROM payments WHERE charge_id = $1', [chargeId]);
+      if (!dup.rows.length) {
+        await pool.query('INSERT INTO payments (charge_id, tg_id, product, stars) VALUES ($1,$2,$3,$4)', [chargeId, tgId, productType, pay.total_amount]);
+        if (productType === 'pack10') await pool.query('UPDATE users SET balance = balance + 10 WHERE tg_id = $1', [tgId]);
+        else if (productType === 'custom_tries') await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
+        else if (SUBSCRIPTIONS[productType]) {
+          const sub = SUBSCRIPTIONS[productType];
+          await pool.query(`UPDATE users SET balance = balance + $1, own_tries = own_tries + $2, sub_active = TRUE WHERE tg_id = $3`, [sub.tries, sub.own || 0, tgId]);
+        }
+      }
+    } catch (e) { console.error('[webhook]', e.message); }
+  }
+  res.sendStatus(200);
+});
+
+// ============================================================
+// HEALTH + CRON
+// ============================================================
+app.get('/', (_req, res) => res.send('GF Style Room API ✨'));
+app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+cron.schedule('0 0,12 * * *', () => { refreshCatalog(); });
+cron.schedule('0 3 * * *', async () => { try { await pool.query('SELECT deleted_count FROM cleanup_old_products()'); } catch {} });
+
+pool.query('SELECT COUNT(*)::int AS c FROM products')
+  .then(r => { if (r.rows[0].c === 0) refreshCatalog(); })
+  .catch(() => {});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
