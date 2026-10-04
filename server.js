@@ -9,7 +9,6 @@ import { pool } from './db.js';
 import { refreshCatalog } from './wbParser.js';
 
 const app = express();
-const allowed = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({ origin: (o, cb) => cb(null, true), credentials: true }));
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
@@ -37,7 +36,6 @@ function verifyTelegramInitData(initData) {
     return ok ? JSON.parse(p.get('user')) : null;
   } catch { return null; }
 }
-
 async function tgApi(method, payload) {
   const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -49,63 +47,39 @@ const sendMessage = (chatId, text, keyboard = null) =>
   tgApi('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...(keyboard ? { reply_markup: keyboard } : {}) });
 const editMessage = (chatId, messageId, text, keyboard = null) =>
   tgApi('editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', ...(keyboard ? { reply_markup: keyboard } : {}) });
-const answerCallback = (callbackId, text = '') =>
-  tgApi('answerCallbackQuery', { callback_query_id: callbackId, text });
+const answerCallback = (id, text = '') => tgApi('answerCallbackQuery', { callback_query_id: id, text });
 
 async function isAdmin(tgId) {
-  try {
-    const r = await pool.query('SELECT is_admin FROM users WHERE tg_id = $1', [tgId]);
-    return r.rows[0]?.is_admin === true;
-  } catch { return false; }
+  try { const r = await pool.query('SELECT is_admin FROM users WHERE tg_id = $1', [tgId]); return r.rows[0]?.is_admin === true; }
+  catch { return false; }
 }
 
 function basketFor(id) {
   const vol = Math.floor(id / 100000);
-  if (vol <= 143) return '01';
-  if (vol <= 287) return '02';
-  if (vol <= 431) return '03';
-  if (vol <= 719) return '04';
-  if (vol <= 1007) return '05';
-  if (vol <= 1061) return '06';
-  if (vol <= 1115) return '07';
-  if (vol <= 1169) return '08';
-  if (vol <= 1313) return '09';
-  if (vol <= 1601) return '10';
-  if (vol <= 1655) return '11';
-  if (vol <= 1919) return '12';
-  if (vol <= 2045) return '13';
-  if (vol <= 2189) return '14';
-  if (vol <= 2405) return '15';
-  if (vol <= 2621) return '16';
-  if (vol <= 2837) return '17';
-  return '18';
+  if (vol <= 143) return '01'; if (vol <= 287) return '02'; if (vol <= 431) return '03';
+  if (vol <= 719) return '04'; if (vol <= 1007) return '05'; if (vol <= 1061) return '06';
+  if (vol <= 1115) return '07'; if (vol <= 1169) return '08'; if (vol <= 1313) return '09';
+  if (vol <= 1601) return '10'; if (vol <= 1655) return '11'; if (vol <= 1919) return '12';
+  if (vol <= 2045) return '13'; if (vol <= 2189) return '14'; if (vol <= 2405) return '15';
+  if (vol <= 2621) return '16'; if (vol <= 2837) return '17'; return '18';
 }
 function primaryImageUrl(id) {
-  const vol = Math.floor(id / 100000);
-  const part = Math.floor(id / 1000);
-  return `https://spb-basket-cdn-03.geobasket.ru/vol${vol}/part${part}/${id}/images/hq/1.webp`;
+  return `https://spb-basket-cdn-03.geobasket.ru/vol${Math.floor(id/100000)}/part${Math.floor(id/1000)}/${id}/images/hq/1.webp`;
 }
 function fallbackImageUrl(id) {
-  const vol = Math.floor(id / 100000);
-  const part = Math.floor(id / 1000);
-  return `https://basket-${basketFor(id)}.wbbasket.ru/vol${vol}/part${part}/${id}/images/big/1.webp`;
+  return `https://basket-${basketFor(id)}.wbbasket.ru/vol${Math.floor(id/100000)}/part${Math.floor(id/1000)}/${id}/images/big/1.webp`;
 }
 function extractWbIds(text) {
-  const ids = new Set();
-  let m;
-  const re1 = /\/catalog\/(\d{6,})/g;
-  while ((m = re1.exec(text)) !== null) ids.add(Number(m[1]));
-  const re2 = /\b(\d{6,})\b/g;
-  while ((m = re2.exec(text)) !== null) ids.add(Number(m[1]));
+  const ids = new Set(); let m;
+  const re1 = /\/catalog\/(\d{6,})/g; while ((m = re1.exec(text)) !== null) ids.add(Number(m[1]));
+  const re2 = /\b(\d{6,})\b/g;      while ((m = re2.exec(text)) !== null) ids.add(Number(m[1]));
   return Array.from(ids);
 }
 async function fetchWBProductInfo(wbId) {
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'ru-RU,ru;q=0.9',
-    'Origin': 'https://www.wildberries.ru',
-    'Referer': 'https://www.wildberries.ru/',
+    'Accept': 'application/json, text/plain, */*', 'Accept-Language': 'ru-RU,ru;q=0.9',
+    'Origin': 'https://www.wildberries.ru', 'Referer': 'https://www.wildberries.ru/',
   };
   const urls = [
     `https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm=${wbId}`,
@@ -115,23 +89,17 @@ async function fetchWBProductInfo(wbId) {
   ];
   for (const url of urls) {
     try {
-      const r = await fetch(url, { headers });
-      if (!r.ok) continue;
+      const r = await fetch(url, { headers }); if (!r.ok) continue;
       const data = await r.json();
       const p1 = data?.data?.products?.[0];
       if (p1?.name) return { wb_id: wbId, name: p1.name, price: p1.salePriceU ? `${Math.round(p1.salePriceU/100).toLocaleString('ru-RU')} ₽` : null };
       const name2 = data?.imt_name || data?.subj_name;
-      if (name2) {
-        const price2 = data?.sizes?.[0]?.price?.total ? `${Math.round(data.sizes[0].price.total/100).toLocaleString('ru-RU')} ₽` : null;
-        return { wb_id: wbId, name: name2, price: price2 };
-      }
+      if (name2) return { wb_id: wbId, name: name2, price: data?.sizes?.[0]?.price?.total ? `${Math.round(data.sizes[0].price.total/100).toLocaleString('ru-RU')} ₽` : null };
       if (data?.name) return { wb_id: wbId, name: data.name, price: null };
     } catch {}
   }
   return null;
 }
-
-// ВАЖНО: аксессуары полностью убраны
 function guessCategory(name) {
   const n = (name || '').toLowerCase();
   if (/(пальто|тренч|пуховик|шуба|плащ|ветровка|бомбер|дубленка|кожанк|куртк|жилет)/.test(n)) return 'outerwear';
@@ -169,39 +137,15 @@ app.post('/api/auth', async (req, res) => {
       return res.json({ success: true, user: ins.rows[0] });
     }
     const upd = await pool.query(
-      `UPDATE users SET first_name=$1, username=$2, photo_url=$3, last_active=NOW()
-       WHERE tg_id=$4 RETURNING *`,
+      `UPDATE users SET first_name=$1, username=$2, photo_url=$3, last_active=NOW() WHERE tg_id=$4 RETURNING *`,
       [first_name || null, username || null, photo_url || null, tgId]
     );
     res.json({ success: true, user: upd.rows[0] });
-  } catch (e) {
-    console.error('[auth]', e.message);
-    res.status(500).json({ error: 'Server error' });
-  }
+  } catch (e) { console.error('[auth]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
 // ============================================================
-// IMG PROXY
-// ============================================================
-app.get('/api/img', async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).send('Bad url');
-  let parsed;
-  try { parsed = new URL(url); } catch { return res.status(400).send('Bad url'); }
-  const okHosts = [/\.wbbasket\.ru$/, /\.wbstatic\.net$/, /\.geobasket\.ru$/];
-  if (!okHosts.some(rx => rx.test(parsed.hostname))) return res.status(400).send('Bad host');
-  try {
-    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' } });
-    if (!r.ok) return res.status(404).send('Not found');
-    const buf = await r.buffer();
-    res.set('Content-Type', r.headers.get('content-type') || 'image/webp');
-    res.set('Cache-Control', 'public, max-age=604800, immutable');
-    res.send(buf);
-  } catch { res.status(500).send('Proxy error'); }
-});
-
-// ============================================================
-// CATALOG — аксессуары НЕ отдаём
+// CATALOG (без аксессуаров)
 // ============================================================
 app.get('/api/catalog', async (req, res) => {
   try {
@@ -209,8 +153,7 @@ app.get('/api/catalog', async (req, res) => {
     const params = [];
     let where = "WHERE is_active = TRUE AND category != 'accessory'";
     if (category && category !== 'all' && category !== 'accessory') {
-      params.push(category);
-      where += ` AND category = $${params.length}`;
+      params.push(category); where += ` AND category = $${params.length}`;
     }
     params.push(Number(limit), Number(offset));
     const q = `
@@ -229,46 +172,50 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// FAL: только одна модель, без аксессуаров
-// Возвращает { url, isMock } — НЕ бросает исключений
+// FAL — 3 модели по очереди, никогда не бросает
 // ============================================================
+async function tryFashnV16(humanImg, garmentUrl) {
+  const r = await fal.subscribe('fal-ai/fashn/tryon/v1.6', {
+    input: { model_image: humanImg, garment_image: garmentUrl, category: 'auto', mode: 'performance', acceleration: 'high' },
+    logs: false,
+  });
+  return r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
+}
+async function tryFashnV15(humanImg, garmentUrl) {
+  const r = await fal.subscribe('fal-ai/fashn/tryon/v1.5', {
+    input: { model_image: humanImg, garment_image: garmentUrl },
+    logs: false,
+  });
+  return r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
+}
+async function tryImageApps(humanImg, garmentUrl) {
+  const r = await fal.subscribe('fal-ai/image-apps-v2/virtual-try-on', {
+    input: { person_image_url: humanImg, clothing_image_url: garmentUrl },
+    logs: false,
+  });
+  return r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
+}
+
 async function runFalTryon({ humanImg, garmentUrl }) {
-  // пробуем fashn
-  try {
-    const r = await fal.subscribe('fal-ai/fashn/tryon/v1.6', {
-      input: {
-        model_image: humanImg,
-        garment_image: garmentUrl,
-        category: 'auto',
-        mode: 'performance',
-        acceleration: 'high',
-      },
-      logs: false,
-    });
-    const url = r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
-    if (url) return { url, isMock: false, model: 'fashn' };
-    console.warn('[tryon] fashn вернул пусто');
-  } catch (e) {
-    console.warn('[tryon] fashn failed:', e.message);
+  const attempts = [
+    { name: 'fashn-v1.6', fn: () => tryFashnV16(humanImg, garmentUrl) },
+    { name: 'fashn-v1.5', fn: () => tryFashnV15(humanImg, garmentUrl) },
+    { name: 'image-apps-v2', fn: () => tryImageApps(humanImg, garmentUrl) },
+  ];
+  for (const a of attempts) {
+    try {
+      const url = await a.fn();
+      if (url) { console.log(`[tryon] ✅ ${a.name}`); return { url, model: a.name }; }
+      console.warn(`[tryon] ${a.name} empty`);
+    } catch (e) {
+      console.warn(`[tryon] ❌ ${a.name}: ${e.message}`);
+    }
   }
-  // fallback — image-apps
-  try {
-    const r = await fal.subscribe('fal-ai/image-apps-v2/virtual-try-on', {
-      input: { person_image_url: humanImg, clothing_image_url: garmentUrl },
-      logs: false,
-    });
-    const url = r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
-    if (url) return { url, isMock: false, model: 'image-apps' };
-    console.warn('[tryon] image-apps вернул пусто');
-  } catch (e) {
-    console.warn('[tryon] image-apps failed:', e.message);
-  }
-  // всё упало
-  return { url: null, isMock: true, model: null };
+  return { url: null, model: null };
 }
 
 // ============================================================
-// TRYON — СПИСЫВАЕМ ТОЛЬКО ПРИ УСПЕХЕ
+// TRYON — списание только при успехе
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
   const t0 = Date.now();
@@ -277,42 +224,29 @@ app.post('/api/tryon', async (req, res) => {
   if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
   const tgId = tgUser.id;
 
+  if (!humanImg || !garmentUrl) return res.status(400).json({ error: 'Нет фото или товара' });
+
   try {
     const u = await pool.query('SELECT * FROM users WHERE tg_id = $1', [tgId]);
     if (!u.rows.length) return res.status(404).json({ error: 'User not found' });
     const user = u.rows[0];
     const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
 
-    // Проверка баланса ДО генерации (но БЕЗ списания)
-    if (!hasUnlimited && user.balance <= 0) {
-      return res.status(402).json({ error: 'Нет попыток' });
+    if (!hasUnlimited && user.balance <= 0) return res.status(402).json({ error: 'Нет попыток' });
+
+    const { url: resultUrl, model } = await runFalTryon({ humanImg, garmentUrl });
+
+    if (!resultUrl) {
+      console.warn(`[tryon] all models failed (${Date.now() - t0}ms) — НЕ списано`);
+      return res.json({ success: false, error: 'Не удалось сгенерировать. Попытки не списаны.' });
     }
 
-    // Генерируем СНАЧАЛА
-    console.log(`[tryon] start (user ${tgId}, item ${itemId})`);
-    const { url: resultUrl, isMock, model } = await runFalTryon({ humanImg, garmentUrl });
-
-    // Если не получилось — НЕ списываем
-    if (isMock || !resultUrl) {
-      console.warn(`[tryon] generation failed (${Date.now() - t0}ms) — попытки не списаны`);
-      return res.json({
-        success: false,
-        error: 'Не удалось сгенерировать фото. Попробуйте другое фото или позже.',
-        isMock: true,
-      });
-    }
-
-    // Всё ок — списываем
-    if (!hasUnlimited) {
-      await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
-    }
-    console.log(`[tryon] OK ${model} (${Date.now() - t0}ms) — списана 1 попытка`);
+    if (!hasUnlimited) await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
 
     const snap = itemId ? (await pool.query('SELECT wb_id, name, image_url FROM products WHERE id = $1', [itemId])).rows[0] || {} : {};
 
     await pool.query(
-      `INSERT INTO tryon_history
-         (user_id, product_id, product_wb_id, product_name, product_image, result_url, is_mock, category)
+      `INSERT INTO tryon_history (user_id, product_id, product_wb_id, product_name, product_image, result_url, is_mock, category)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [tgId, itemId ? Number(itemId) : null, snap.wb_id || null, snap.name || null, snap.image_url || null, resultUrl, false, category || null]
     );
@@ -323,76 +257,16 @@ app.post('/api/tryon', async (req, res) => {
       sendMessage(user.ref_by, '🎉 Твоя подруга сделала первую примерку! +3 попытки ✨').catch(() => {});
     }
 
-    res.json({ success: true, resultUrl, isMock: false, took: Date.now() - t0 });
+    console.log(`[tryon] OK ${model} (${Date.now() - t0}ms) — списано`);
+    res.json({ success: true, resultUrl, model, took: Date.now() - t0 });
   } catch (e) {
     console.error('[tryon]', e.message);
-    res.json({ success: false, error: 'Ошибка генерации. Попытки не списаны.' });
+    res.json({ success: false, error: 'Ошибка. Попытки не списаны.' });
   }
 });
 
 // ============================================================
-// TRYON BY LINK — свои товары (тоже списание только при успехе)
-// ============================================================
-app.post('/api/tryon-by-link', async (req, res) => {
-  const t0 = Date.now();
-  const { initData, humanImg, wbLink } = req.body;
-  const tgUser = verifyTelegramInitData(initData);
-  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
-  const tgId = tgUser.id;
-
-  if (!humanImg || !wbLink) return res.status(400).json({ error: 'Нужно фото и ссылка' });
-  const ids = extractWbIds(wbLink);
-  if (!ids.length) return res.status(400).json({ error: 'Не нашёл артикул в ссылке' });
-  const wbId = ids[0];
-
-  try {
-    const u = await pool.query('SELECT * FROM users WHERE tg_id = $1', [tgId]);
-    if (!u.rows.length) return res.status(404).json({ error: 'User not found' });
-    const user = u.rows[0];
-    const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
-
-    if (!hasUnlimited && (user.own_tries || 0) <= 0) {
-      return res.status(402).json({ error: 'Нет попыток для своих товаров' });
-    }
-
-    const info = await fetchWBProductInfo(wbId);
-    const garmentUrl = primaryImageUrl(wbId);
-    const productName = info?.name || `Товар ${wbId}`;
-
-    const { url: resultUrl, isMock } = await runFalTryon({ humanImg, garmentUrl });
-
-    if (isMock || !resultUrl) {
-      console.warn(`[tryon-by-link] failed (${Date.now() - t0}ms) — попытки не списаны`);
-      return res.json({ success: false, error: 'Не удалось сгенерировать фото. Попытки не списаны.' });
-    }
-
-    if (!hasUnlimited) {
-      await pool.query('UPDATE users SET own_tries = own_tries - 1 WHERE tg_id = $1', [tgId]);
-    }
-
-    await pool.query(
-      `INSERT INTO tryon_history
-         (user_id, product_id, product_wb_id, product_name, product_image, result_url, is_mock, category)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [tgId, null, wbId, productName, garmentUrl, resultUrl, false, null]
-    );
-
-    try {
-      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: tgId, photo: resultUrl, caption: '✨ Твоя примерка готова!' }),
-      });
-    } catch {}
-
-    res.json({ success: true, resultUrl, isMock: false, productName, took: Date.now() - t0 });
-  } catch (e) {
-    console.error('[tryon-by-link]', e.message);
-    res.json({ success: false, error: 'Ошибка генерации. Попытки не списаны.' });
-  }
-});
-
-// ============================================================
-// TRYON MULTI — тоже только при успехе (за все N фото)
+// MULTI — только 2–3 вещи, разные категории
 // ============================================================
 app.post('/api/tryon-multi', async (req, res) => {
   const t0 = Date.now();
@@ -401,8 +275,14 @@ app.post('/api/tryon-multi', async (req, res) => {
   if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
   const tgId = tgUser.id;
 
-  if (!Array.isArray(items) || items.length < 2 || items.length > 4) {
-    return res.status(400).json({ error: 'Нужно 2–4 вещи' });
+  if (!Array.isArray(items) || items.length < 2 || items.length > 3) {
+    return res.status(400).json({ error: 'Нужно 2–3 вещи' });
+  }
+  // Проверка: все категории разные
+  const cats = items.map(i => i.category);
+  const uniq = new Set(cats);
+  if (uniq.size !== cats.length) {
+    return res.status(400).json({ error: 'Выберите вещи из разных категорий (нельзя два верха, два низа и т.д.)' });
   }
 
   try {
@@ -411,50 +291,38 @@ app.post('/api/tryon-multi', async (req, res) => {
     const user = u.rows[0];
     const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
     const need = items.length;
-
     if (!hasUnlimited && user.balance < need) {
       return res.status(402).json({ error: `Нужно ${need} попыток (у вас ${user.balance})` });
     }
 
     const results = [];
     let prevImg = humanImg;
-    let successCount = 0;
-
+    let success = 0;
     for (const item of items) {
-      const { url, isMock } = await runFalTryon({ humanImg: prevImg, garmentUrl: item.image_url });
-      if (isMock || !url) {
-        results.push({ itemId: item.id, name: item.name, url: null, isMock: true });
-      } else {
-        results.push({ itemId: item.id, name: item.name, url, isMock: false });
-        prevImg = url;
-        successCount++;
-      }
+      const { url } = await runFalTryon({ humanImg: prevImg, garmentUrl: item.image_url });
+      if (url) { results.push({ itemId: item.id, name: item.name, url }); prevImg = url; success++; }
+      else results.push({ itemId: item.id, name: item.name, url: null });
     }
 
-    // Списываем только за успешные
-    if (!hasUnlimited && successCount > 0) {
-      await pool.query('UPDATE users SET balance = GREATEST(0, balance - $1) WHERE tg_id = $2', [successCount, tgId]);
+    if (!hasUnlimited && success > 0) {
+      await pool.query('UPDATE users SET balance = GREATEST(0, balance - $1) WHERE tg_id = $2', [success, tgId]);
     }
 
     for (const r of results) {
       if (r.url) {
         await pool.query(
-          `INSERT INTO tryon_history
-             (user_id, product_id, product_wb_id, product_name, product_image, result_url, is_mock, category)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [tgId, r.itemId || null, null, r.name || null, null, r.url, false, null]
+          `INSERT INTO tryon_history (user_id, product_id, product_name, result_url, is_mock)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [tgId, r.itemId || null, r.name || null, r.url, false]
         );
       }
     }
 
-    if (successCount === 0) {
-      return res.json({ success: false, error: 'Не удалось сгенерировать. Попытки не списаны.' });
-    }
-
-    res.json({ success: true, results, charged: successCount, took: Date.now() - t0 });
+    if (success === 0) return res.json({ success: false, error: 'Не удалось сгенерировать. Попытки не списаны.' });
+    res.json({ success: true, results, charged: success, took: Date.now() - t0 });
   } catch (e) {
     console.error('[tryon-multi]', e.message);
-    res.json({ success: false, error: 'Ошибка генерации. Попытки не списаны.' });
+    res.json({ success: false, error: 'Ошибка. Попытки не списаны.' });
   }
 });
 
@@ -468,8 +336,7 @@ app.post('/api/history', async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT id, result_url, is_mock, created_at, category,
-              COALESCE(product_name, 'Товар') AS product_name,
-              product_wb_id, product_image
+              COALESCE(product_name, 'Товар') AS product_name, product_wb_id, product_image
        FROM tryon_history WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
       [tgUser.id]
     );
@@ -488,10 +355,7 @@ app.post('/api/redeem-promo', async (req, res) => {
   const cleanCode = String(code || '').trim().toUpperCase();
   if (!cleanCode) return res.status(400).json({ error: 'Введите промокод' });
   try {
-    const promo = await pool.query(
-      `SELECT * FROM promo_codes WHERE code = $1 AND is_active = TRUE AND (expires_at IS NULL OR expires_at > NOW())`,
-      [cleanCode]
-    );
+    const promo = await pool.query(`SELECT * FROM promo_codes WHERE code = $1 AND is_active = TRUE AND (expires_at IS NULL OR expires_at > NOW())`, [cleanCode]);
     if (!promo.rows.length) return res.status(404).json({ error: 'Промокод не найден' });
     const p = promo.rows[0];
     if (p.used_count >= p.max_uses) return res.status(400).json({ error: 'Промокод больше не действует' });
@@ -500,8 +364,7 @@ app.post('/api/redeem-promo', async (req, res) => {
     await pool.query('INSERT INTO promo_uses (code, tg_id) VALUES ($1, $2)', [cleanCode, tgId]);
     await pool.query('UPDATE promo_codes SET used_count = used_count + 1 WHERE code = $1', [cleanCode]);
     if (p.unlimited) {
-      const until = new Date(Date.now() + 24 * 60 * 60 * 1000);
-      await pool.query('UPDATE users SET unlimited_until = $1 WHERE tg_id = $2', [until, tgId]);
+      await pool.query('UPDATE users SET unlimited_until = $1 WHERE tg_id = $2', [new Date(Date.now() + 86400000), tgId]);
       return res.json({ success: true, tries: 0, unlimited: true });
     }
     await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [p.tries, tgId]);
@@ -525,17 +388,14 @@ app.post('/api/create-invoice', async (req, res) => {
   let title = '10 примерок одежды', amount = 50;
   let payload = `pack10:${tgId}:${Date.now()}`;
   if (SUBSCRIPTIONS[productType]) {
-    const sub = SUBSCRIPTIONS[productType];
-    title = sub.title; amount = sub.stars;
+    const sub = SUBSCRIPTIONS[productType]; title = sub.title; amount = sub.stars;
     payload = `${productType}:${tgId}:${Date.now()}`;
   } else if (productType === 'custom_tries') {
     const n = Math.max(1, Math.min(500, Number(tries) || 1));
-    amount = n * 5; title = `${n} примерок`;
-    payload = `custom_tries:${tgId}:${n}:${Date.now()}`;
+    amount = n * 5; title = `${n} примерок`; payload = `custom_tries:${tgId}:${n}:${Date.now()}`;
   } else if (productType === 'custom_own_tries') {
     const n = Math.max(1, Math.min(500, Number(ownTries) || 1));
-    amount = n * 10; title = `${n} своих примерок`;
-    payload = `custom_own_tries:${tgId}:${n}:${Date.now()}`;
+    amount = n * 10; title = `${n} своих примерок`; payload = `custom_own_tries:${tgId}:${n}:${Date.now()}`;
   }
   try {
     const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/createInvoiceLink`, {
@@ -549,454 +409,6 @@ app.post('/api/create-invoice', async (req, res) => {
 });
 
 // ============================================================
-// АДМИН-ПАНЕЛЬ (та же, что была — сокращаю для ответа)
-// ============================================================
-function mainAdminKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: '📊 Статистика', callback_data: 'adm_stats' }],
-      [{ text: '👥 Пользователи', callback_data: 'adm_users' }],
-      [{ text: '🔍 Найти пользователя', callback_data: 'adm_find' }],
-      [{ text: '🎁 Промокоды', callback_data: 'adm_promo' }],
-      [{ text: '🛍 Товары', callback_data: 'adm_products' }],
-      [{ text: '📢 Рассылка', callback_data: 'adm_broadcast' }],
-      [{ text: '⚙️ Настройки', callback_data: 'adm_settings' }],
-      [{ text: '❓ Помощь', callback_data: 'adm_help' }],
-    ],
-  };
-}
-function productsMenuKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: '➕ Добавить по ссылкам WB', callback_data: 'adm_add_links' }],
-      [{ text: '✏️ Добавить вручную', callback_data: 'adm_add_manual' }],
-      [{ text: '📌 Закрепить товар', callback_data: 'adm_pin' }],
-      [{ text: '🙈 Скрыть товар', callback_data: 'adm_hide' }],
-      [{ text: '👁 Вернуть товар', callback_data: 'adm_unhide' }],
-      [{ text: '🗑 Удалить товар', callback_data: 'adm_delete' }],
-      [{ text: '🔄 Обновить названия', callback_data: 'adm_backfill' }],
-      [{ text: '🧹 Удалить товары старше 5 дней', callback_data: 'adm_cleanup' }],
-      [{ text: '← Назад', callback_data: 'adm_back' }],
-    ],
-  };
-}
-function promoMenuKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: '➕ Создать свой промокод', callback_data: 'adm_promo_custom' }],
-      [{ text: '⚡ +2 попытки', callback_data: 'adm_promo_quick_2' }],
-      [{ text: '⚡ +5 попыток', callback_data: 'adm_promo_quick_5' }],
-      [{ text: '⚡ +10 попыток', callback_data: 'adm_promo_quick_10' }],
-      [{ text: '⚡ +20 попыток', callback_data: 'adm_promo_quick_20' }],
-      [{ text: '♾ Безлимит 24ч', callback_data: 'adm_promo_quick_unlimited' }],
-      [{ text: '📋 Список', callback_data: 'adm_promo_list' }],
-      [{ text: '🗑 Удалить', callback_data: 'adm_promo_delete' }],
-      [{ text: '← Назад', callback_data: 'adm_back' }],
-    ],
-  };
-}
-function usersMenuKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: '📋 Последние 20', callback_data: 'adm_users_last' }],
-      [{ text: '💰 Топ по балансу', callback_data: 'adm_users_top' }],
-      [{ text: '🆕 Новые за сутки', callback_data: 'adm_users_new' }],
-      [{ text: '🔍 Найти', callback_data: 'adm_find' }],
-      [{ text: '← Назад', callback_data: 'adm_back' }],
-    ],
-  };
-}
-function userActionsKeyboard(tgId) {
-  return {
-    inline_keyboard: [
-      [{ text: '➕ +5', callback_data: `usr_add_5_${tgId}` }, { text: '➕ +10', callback_data: `usr_add_10_${tgId}` }],
-      [{ text: '➕ +25', callback_data: `usr_add_25_${tgId}` }, { text: '➕ +50', callback_data: `usr_add_50_${tgId}` }],
-      [{ text: '➕ Своё число', callback_data: `usr_add_custom_${tgId}` }],
-      [{ text: '🔄 Обнулить', callback_data: `usr_reset_${tgId}` }],
-      [{ text: '♾ 24ч', callback_data: `usr_unlimit_${tgId}` }, { text: '❌ Снять', callback_data: `usr_unlimit_off_${tgId}` }],
-      [{ text: '💎 Админом', callback_data: `usr_admin_on_${tgId}` }, { text: '❌ Снять', callback_data: `usr_admin_off_${tgId}` }],
-      [{ text: '📩 Написать', callback_data: `usr_dm_${tgId}` }],
-      [{ text: '🗑 Удалить', callback_data: `usr_delete_${tgId}` }],
-      [{ text: '← К юзерам', callback_data: 'adm_users' }],
-    ],
-  };
-}
-
-const awaitingBroadcast = new Set();
-const awaitingUserSearch = new Set();
-const awaitingAddCustom = new Map();
-const awaitingLinks = new Set();
-const awaitingLinksDesc = new Map();
-const awaitingManualProduct = new Map();
-const awaitingPromoCustom = new Map();
-const awaitingProductAction = new Map();
-const awaitingDM = new Map();
-
-function randomCode(len = 6) {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let s = '';
-  for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
-  return s;
-}
-async function handleStart(msg) {
-  if (await isAdmin(msg.from.id)) await sendMessage(msg.chat.id, '👑 <b>Админ-панель Style Room</b>', mainAdminKeyboard());
-  else await sendMessage(msg.chat.id, '✨ Добро пожаловать в Style Room!');
-}
-async function handleAdminMenu(msg) {
-  if (!(await isAdmin(msg.from.id))) return sendMessage(msg.chat.id, '⛔ Нет доступа.');
-  await sendMessage(msg.chat.id, '👑 <b>Админ-панель</b>', mainAdminKeyboard());
-}
-
-async function handleCallback(cb) {
-  const chatId = cb.message.chat.id;
-  const messageId = cb.message.message_id;
-  const data = cb.data;
-  const userId = cb.from.id;
-  if (!(await isAdmin(userId))) return answerCallback(cb.id, '⛔ Нет доступа');
-  await answerCallback(cb.id);
-
-  const back = () => editMessage(chatId, messageId, '👑 <b>Админ-панель</b>', mainAdminKeyboard());
-  const backKb = { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]] };
-
-  if (data === 'adm_back') return back();
-  if (data === 'adm_help') return editMessage(chatId, messageId, '❓ Всё делается по кнопкам.', backKb);
-  if (data === 'adm_stats') {
-    const u = await pool.query('SELECT COUNT(*)::int AS c FROM users');
-    const t = await pool.query('SELECT COUNT(*)::int AS c FROM tryon_history');
-    const p = await pool.query('SELECT COUNT(*)::int AS c FROM products WHERE is_active = TRUE');
-    return editMessage(chatId, messageId, `📊 Юзеров: <b>${u.rows[0].c}</b>\n✨ Примерок: <b>${t.rows[0].c}</b>\n🛍 Товаров: <b>${p.rows[0].c}</b>`, backKb);
-  }
-  if (data === 'adm_users') return editMessage(chatId, messageId, '👥 Пользователи', usersMenuKeyboard());
-  if (data === 'adm_users_last') {
-    const r = await pool.query(`SELECT tg_id, first_name, balance FROM users ORDER BY created_at DESC LIMIT 20`);
-    const btns = r.rows.map(u => [{ text: `${u.first_name || '—'} · ✨${u.balance}`, callback_data: `usr_show_${u.tg_id}` }]);
-    btns.push([{ text: '← Назад', callback_data: 'adm_users' }]);
-    return editMessage(chatId, messageId, '👥 Последние 20:', { inline_keyboard: btns });
-  }
-  if (data === 'adm_users_top') {
-    const r = await pool.query(`SELECT tg_id, first_name, balance FROM users ORDER BY balance DESC LIMIT 20`);
-    const btns = r.rows.map(u => [{ text: `${u.first_name || '—'} · ✨${u.balance}`, callback_data: `usr_show_${u.tg_id}` }]);
-    btns.push([{ text: '← Назад', callback_data: 'adm_users' }]);
-    return editMessage(chatId, messageId, '💰 Топ:', { inline_keyboard: btns });
-  }
-  if (data === 'adm_users_new') {
-    const r = await pool.query(`SELECT tg_id, first_name, balance FROM users WHERE created_at > NOW() - INTERVAL '1 day' ORDER BY created_at DESC LIMIT 20`);
-    const btns = r.rows.map(u => [{ text: `${u.first_name || '—'} · ✨${u.balance}`, callback_data: `usr_show_${u.tg_id}` }]);
-    btns.push([{ text: '← Назад', callback_data: 'adm_users' }]);
-    return editMessage(chatId, messageId, '🆕 Новые:', { inline_keyboard: btns });
-  }
-  if (data === 'adm_find') {
-    awaitingUserSearch.add(userId);
-    return editMessage(chatId, messageId, '🔍 Пришли имя, @username или ID:', { inline_keyboard: [[{ text: '❌', callback_data: 'adm_back' }]] });
-  }
-  if (data.startsWith('usr_show_')) return showUserCard(chatId, messageId, Number(data.replace('usr_show_', '')));
-  if (data.startsWith('usr_add_custom_')) {
-    const tgId = Number(data.replace('usr_add_custom_', ''));
-    awaitingAddCustom.set(userId, tgId);
-    return editMessage(chatId, messageId, '➕ Число:', { inline_keyboard: [[{ text: '❌', callback_data: `usr_show_${tgId}` }]] });
-  }
-  if (/^usr_add_\d+_\d+$/.test(data)) {
-    const [, , count, tgId] = data.split('_');
-    await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [Number(count), Number(tgId)]);
-    return showUserCard(chatId, messageId, Number(tgId), `+${count}`);
-  }
-  if (data.startsWith('usr_reset_')) {
-    const tgId = Number(data.replace('usr_reset_', ''));
-    await pool.query('UPDATE users SET balance = 0 WHERE tg_id = $1', [tgId]);
-    return showUserCard(chatId, messageId, tgId, 'Обнулён');
-  }
-  if (data.startsWith('usr_unlimit_off_')) {
-    const tgId = Number(data.replace('usr_unlimit_off_', ''));
-    await pool.query('UPDATE users SET unlimited_until = NULL WHERE tg_id = $1', [tgId]);
-    return showUserCard(chatId, messageId, tgId, 'Снят');
-  }
-  if (data.startsWith('usr_unlimit_')) {
-    const tgId = Number(data.replace('usr_unlimit_', ''));
-    await pool.query('UPDATE users SET unlimited_until = $1 WHERE tg_id = $2', [new Date(Date.now() + 86400000), tgId]);
-    return showUserCard(chatId, messageId, tgId, '24ч');
-  }
-  if (data.startsWith('usr_admin_on_')) {
-    const tgId = Number(data.replace('usr_admin_on_', ''));
-    await pool.query('UPDATE users SET is_admin = TRUE WHERE tg_id = $1', [tgId]);
-    return showUserCard(chatId, messageId, tgId, '👑');
-  }
-  if (data.startsWith('usr_admin_off_')) {
-    const tgId = Number(data.replace('usr_admin_off_', ''));
-    await pool.query('UPDATE users SET is_admin = FALSE WHERE tg_id = $1', [tgId]);
-    return showUserCard(chatId, messageId, tgId, 'Снят');
-  }
-  if (data.startsWith('usr_dm_')) {
-    const tgId = Number(data.replace('usr_dm_', ''));
-    awaitingDM.set(userId, tgId);
-    return editMessage(chatId, messageId, `📩 Текст для <code>${tgId}</code>:`, { inline_keyboard: [[{ text: '❌', callback_data: `usr_show_${tgId}` }]] });
-  }
-  if (data.startsWith('usr_delete_')) {
-    const tgId = Number(data.replace('usr_delete_', ''));
-    await pool.query('DELETE FROM users WHERE tg_id = $1', [tgId]);
-    return editMessage(chatId, messageId, `🗑 Удалён.`, { inline_keyboard: [[{ text: '←', callback_data: 'adm_users' }]] });
-  }
-
-  if (data === 'adm_products') return editMessage(chatId, messageId, '🛍 Товары', productsMenuKeyboard());
-  if (data === 'adm_add_links') {
-    awaitingLinks.add(userId);
-    return editMessage(chatId, messageId, '➕ Ссылки WB одним сообщением:', { inline_keyboard: [[{ text: '❌', callback_data: 'adm_products' }]] });
-  }
-  if (data === 'adm_add_manual') {
-    awaitingManualProduct.set(userId, { step: 'wb_id' });
-    return editMessage(chatId, messageId, '✏️ Шаг 1/5: ссылка WB:', { inline_keyboard: [[{ text: '❌', callback_data: 'adm_products' }]] });
-  }
-  if (['adm_pin', 'adm_hide', 'adm_unhide', 'adm_delete'].includes(data)) {
-    const action = data.replace('adm_', '');
-    awaitingProductAction.set(userId, action);
-    return editMessage(chatId, messageId, `Ссылка WB для «${action}»:`, { inline_keyboard: [[{ text: '❌', callback_data: 'adm_products' }]] });
-  }
-  if (data === 'adm_backfill') {
-    return editMessage(chatId, messageId, '🔄 Обновляю…', backKb).then(async () => {
-      try {
-        const r = await pool.query(`SELECT id, wb_id FROM products WHERE name LIKE 'Товар WB%' OR name IS NULL OR name = '' ORDER BY id DESC LIMIT 200`);
-        let updated = 0, failed = 0;
-        for (const row of r.rows) {
-          const info = await fetchWBProductInfo(row.wb_id);
-          if (info?.name && !info.name.startsWith('Товар WB')) {
-            await pool.query(`UPDATE products SET name=$1, price=COALESCE($2, price), updated_at=NOW() WHERE id=$3`, [info.name, info.price, row.id]);
-            updated++;
-          } else failed++;
-          await new Promise(rs => setTimeout(rs, 250));
-        }
-        await sendMessage(chatId, `✅ Обновлено: ${updated}, не удалось: ${failed}`, backKb);
-      } catch (e) { await sendMessage(chatId, '❌ ' + e.message, backKb); }
-    });
-  }
-  if (data === 'adm_cleanup') {
-    try {
-      const r = await pool.query('SELECT deleted_count FROM cleanup_old_products()');
-      return editMessage(chatId, messageId, `🧹 Удалено: ${r.rows[0].deleted_count}`, backKb);
-    } catch (e) { return editMessage(chatId, messageId, '❌ ' + e.message, backKb); }
-  }
-
-  if (data === 'adm_promo') return editMessage(chatId, messageId, '🎁 Промокоды', promoMenuKeyboard());
-  if (data === 'adm_promo_custom') {
-    awaitingPromoCustom.set(userId, { step: 'code' });
-    return editMessage(chatId, messageId, '🎁 Шаг 1/3: код:', { inline_keyboard: [[{ text: '❌', callback_data: 'adm_promo' }]] });
-  }
-  if (data.startsWith('adm_promo_quick_')) {
-    const type = data.replace('adm_promo_quick_', '');
-    const code = randomCode();
-    let tries = 0, unlimited = false;
-    if (type === 'unlimited') unlimited = true; else tries = Number(type);
-    await pool.query(`INSERT INTO promo_codes (code, tries, unlimited, max_uses, is_active, label) VALUES ($1, $2, $3, 1000, TRUE, $4)`,
-      [code, tries, unlimited, unlimited ? 'Безлимит 24ч' : `+${tries}`]);
-    return editMessage(chatId, messageId, `✅ Код: <code>${code}</code>`, { inline_keyboard: [[{ text: '🎁', callback_data: 'adm_promo' }]] });
-  }
-  if (data === 'adm_promo_list') {
-    const r = await pool.query(`SELECT code, tries, unlimited, used_count, max_uses, is_active FROM promo_codes ORDER BY created_at DESC LIMIT 20`);
-    let m = '📋 Промокоды:\n\n';
-    for (const p of r.rows) m += `<code>${p.code}</code> · ${p.unlimited ? '💎' : '+' + p.tries} · ${p.used_count}/${p.max_uses}${p.is_active ? '' : ' · ⛔'}\n`;
-    return editMessage(chatId, messageId, m || 'Пусто', { inline_keyboard: [[{ text: '←', callback_data: 'adm_promo' }]] });
-  }
-  if (data === 'adm_promo_delete') {
-    const r = await pool.query(`SELECT code FROM promo_codes WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 10`);
-    const btns = r.rows.map(p => [{ text: '❌ ' + p.code, callback_data: 'adm_promodel_' + p.code }]);
-    btns.push([{ text: '← Назад', callback_data: 'adm_promo' }]);
-    return editMessage(chatId, messageId, 'Выбери:', { inline_keyboard: btns });
-  }
-  if (data.startsWith('adm_promodel_')) {
-    const code = data.replace('adm_promodel_', '');
-    await pool.query('UPDATE promo_codes SET is_active = FALSE WHERE code = $1', [code]);
-    return editMessage(chatId, messageId, `✅`, { inline_keyboard: [[{ text: '←', callback_data: 'adm_promo' }]] });
-  }
-  if (data === 'adm_broadcast') {
-    awaitingBroadcast.add(userId);
-    return editMessage(chatId, messageId, '📢 Текст:', { inline_keyboard: [[{ text: '❌', callback_data: 'adm_back' }]] });
-  }
-  if (data === 'adm_settings') {
-    const admins = await pool.query(`SELECT tg_id, first_name FROM users WHERE is_admin = TRUE`);
-    let m = '⚙️ Админы:\n';
-    for (const a of admins.rows) m += `• ${a.first_name || '—'} · <code>${a.tg_id}</code>\n`;
-    return editMessage(chatId, messageId, m, { inline_keyboard: [[{ text: '←', callback_data: 'adm_back' }]] });
-  }
-}
-
-async function showUserCard(chatId, messageId, tgId, toast = null) {
-  try {
-    const r = await pool.query(
-      `SELECT tg_id, first_name, username, balance, own_tries, sub_active, unlimited_until, is_admin, created_at,
-              (SELECT COUNT(*)::int FROM tryon_history WHERE user_id = users.tg_id) AS total_tryons
-       FROM users WHERE tg_id = $1`, [tgId]);
-    if (!r.rows.length) {
-      const txt = `❌ Юзер не найден.`;
-      return messageId ? editMessage(chatId, messageId, txt) : sendMessage(chatId, txt);
-    }
-    const u = r.rows[0];
-    const text = `${toast ? '✅ ' + toast + '\n\n' : ''}👤 <b>${u.first_name || '—'}</b>\n🆔 <code>${u.tg_id}</code>${u.is_admin ? '\n👑' : ''}\n\n` +
-      `✨ Обычных: <b>${u.balance}</b>\n📦 Своих: <b>${u.own_tries}</b>\n🎨 Примерок: <b>${u.total_tryons}</b>`;
-    const kb = userActionsKeyboard(tgId);
-    return messageId ? editMessage(chatId, messageId, text, kb) : sendMessage(chatId, text, kb);
-  } catch (e) { return messageId ? editMessage(chatId, messageId, '❌ ' + e.message) : sendMessage(chatId, '❌ ' + e.message); }
-}
-
-async function handleBroadcastText(msg) {
-  if (!awaitingBroadcast.has(msg.from.id)) return false;
-  awaitingBroadcast.delete(msg.from.id);
-  const r = await pool.query('SELECT tg_id FROM users');
-  let sent = 0;
-  for (const u of r.rows) { try { await sendMessage(u.tg_id, msg.text); sent++; if (sent % 25 === 0) await new Promise(rs => setTimeout(rs, 1000)); } catch {} }
-  await sendMessage(msg.chat.id, `✅ Отправлено: ${sent}`, mainAdminKeyboard());
-  return true;
-}
-async function handleUserSearch(msg) {
-  if (!awaitingUserSearch.has(msg.from.id)) return false;
-  awaitingUserSearch.delete(msg.from.id);
-  const q = msg.text.trim();
-  let r;
-  if (/^\d+$/.test(q)) r = await pool.query('SELECT tg_id FROM users WHERE tg_id = $1', [Number(q)]);
-  else if (q.startsWith('@')) r = await pool.query('SELECT tg_id FROM users WHERE LOWER(username) = LOWER($1)', [q.slice(1)]);
-  else r = await pool.query('SELECT tg_id FROM users WHERE LOWER(first_name) LIKE LOWER($1) LIMIT 20', [`%${q}%`]);
-  if (!r.rows.length) { await sendMessage(msg.chat.id, '❌ Не найдено', mainAdminKeyboard()); return true; }
-  if (r.rows.length === 1) { await showUserCard(msg.chat.id, null, r.rows[0].tg_id, 'Найден'); return true; }
-  const btns = r.rows.map(u => [{ text: `ID ${u.tg_id}`, callback_data: `usr_show_${u.tg_id}` }]);
-  await sendMessage(msg.chat.id, `🔍 ${r.rows.length}:`, { inline_keyboard: btns });
-  return true;
-}
-async function handleAddCustomText(msg) {
-  if (!awaitingAddCustom.has(msg.from.id)) return false;
-  const target = awaitingAddCustom.get(msg.from.id);
-  awaitingAddCustom.delete(msg.from.id);
-  const n = Number(msg.text.trim());
-  if (!Number.isFinite(n) || n === 0) { await sendMessage(msg.chat.id, '❌ Число'); return true; }
-  await pool.query('UPDATE users SET balance = GREATEST(0, balance + $1) WHERE tg_id = $2', [n, target]);
-  await showUserCard(msg.chat.id, null, target, `+${n}`);
-  return true;
-}
-async function handleDM(msg) {
-  if (!awaitingDM.has(msg.from.id)) return false;
-  const target = awaitingDM.get(msg.from.id);
-  awaitingDM.delete(msg.from.id);
-  try { await sendMessage(target, `📩 <b>Сообщение:</b>\n\n${msg.text}`); await sendMessage(msg.chat.id, '✅', mainAdminKeyboard()); }
-  catch (e) { await sendMessage(msg.chat.id, '❌ ' + e.message, mainAdminKeyboard()); }
-  return true;
-}
-async function handleLinksText(msg) {
-  if (!awaitingLinks.has(msg.from.id)) return false;
-  awaitingLinks.delete(msg.from.id);
-  const ids = extractWbIds(msg.text);
-  if (!ids.length) { await sendMessage(msg.chat.id, '❌ Нет ссылок', mainAdminKeyboard()); return true; }
-  awaitingLinksDesc.set(msg.from.id, ids);
-  await sendMessage(msg.chat.id, `📝 Описание для ${ids.length} товаров (или «-»):`, { inline_keyboard: [[{ text: '❌', callback_data: 'adm_products' }]] });
-  return true;
-}
-async function handleLinksDescText(msg) {
-  if (!awaitingLinksDesc.has(msg.from.id)) return false;
-  const ids = awaitingLinksDesc.get(msg.from.id);
-  awaitingLinksDesc.delete(msg.from.id);
-  const description = msg.text.trim() === '-' ? null : msg.text.trim();
-  let added = 0, failed = 0;
-  for (const wbId of ids) {
-    try {
-      const info = await fetchWBProductInfo(wbId);
-      const name = info?.name || `Товар ${wbId}`;
-      const category = guessCategory(name);
-      await pool.query(
-        `INSERT INTO products (wb_id, name, price, category, image_url, fallback_url, is_active, source, description, updated_at, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,TRUE,'manual',$7,NOW(),NOW())
-         ON CONFLICT (wb_id) DO UPDATE SET name=EXCLUDED.name, price=EXCLUDED.price, category=EXCLUDED.category,
-           image_url=EXCLUDED.image_url, fallback_url=EXCLUDED.fallback_url, is_active=TRUE, description=EXCLUDED.description, updated_at=NOW()`,
-        [wbId, name, info?.price || null, category, primaryImageUrl(wbId), fallbackImageUrl(wbId), description]);
-      added++;
-    } catch { failed++; }
-  }
-  await sendMessage(msg.chat.id, `✅ Добавлено: ${added}, ошибок: ${failed}`, mainAdminKeyboard());
-  return true;
-}
-async function handleManualProductText(msg) {
-  if (!awaitingManualProduct.has(msg.from.id)) return false;
-  const state = awaitingManualProduct.get(msg.from.id);
-  const text = msg.text.trim();
-  if (state.step === 'wb_id') {
-    const ids = extractWbIds(text);
-    if (!ids.length) { await sendMessage(msg.chat.id, '❌ Ссылка?'); return true; }
-    state.wb_id = ids[0]; state.step = 'name';
-    awaitingManualProduct.set(msg.from.id, state);
-    await sendMessage(msg.chat.id, 'Шаг 2/5: название:');
-    return true;
-  }
-  if (state.step === 'name') { state.name = text; state.step = 'price'; awaitingManualProduct.set(msg.from.id, state); await sendMessage(msg.chat.id, 'Шаг 3/5: цена:'); return true; }
-  if (state.step === 'price') { state.price = text; state.step = 'category'; awaitingManualProduct.set(msg.from.id, state); await sendMessage(msg.chat.id, 'Шаг 4/5: категория (top/bottom/outerwear/suit/dress):'); return true; }
-  if (state.step === 'category') {
-    const allowed = ['top', 'bottom', 'outerwear', 'suit', 'dress'];
-    const cat = text.toLowerCase().trim();
-    if (!allowed.includes(cat)) { await sendMessage(msg.chat.id, '❌ ' + allowed.join(', ')); return true; }
-    state.category = cat; state.step = 'description';
-    awaitingManualProduct.set(msg.from.id, state);
-    await sendMessage(msg.chat.id, 'Шаг 5/5: описание (или «-»):');
-    return true;
-  }
-  if (state.step === 'description') {
-    state.description = text === '-' ? null : text;
-    awaitingManualProduct.delete(msg.from.id);
-    try {
-      await pool.query(
-        `INSERT INTO products (wb_id, name, price, category, image_url, fallback_url, is_active, source, description, updated_at, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,TRUE,'manual',$7,NOW(),NOW())
-         ON CONFLICT (wb_id) DO UPDATE SET name=EXCLUDED.name, price=EXCLUDED.price, category=EXCLUDED.category,
-           image_url=EXCLUDED.image_url, fallback_url=EXCLUDED.fallback_url, is_active=TRUE, description=EXCLUDED.description, updated_at=NOW()`,
-        [state.wb_id, state.name, state.price, state.category, primaryImageUrl(state.wb_id), fallbackImageUrl(state.wb_id), state.description]);
-      await sendMessage(msg.chat.id, `✅ Добавлен: <b>${state.name}</b>`, mainAdminKeyboard());
-    } catch (e) { await sendMessage(msg.chat.id, '❌ ' + e.message, mainAdminKeyboard()); }
-    return true;
-  }
-}
-async function handleProductAction(msg) {
-  if (!awaitingProductAction.has(msg.from.id)) return false;
-  const action = awaitingProductAction.get(msg.from.id);
-  const ids = extractWbIds(msg.text);
-  if (!ids.length) { await sendMessage(msg.chat.id, '❌ Ссылка?'); return true; }
-  awaitingProductAction.delete(msg.from.id);
-  const wbId = ids[0];
-  const exists = await pool.query('SELECT name FROM products WHERE wb_id = $1', [wbId]);
-  if (!exists.rows.length) { await sendMessage(msg.chat.id, `❌ Не найден`, mainAdminKeyboard()); return true; }
-  if (action === 'pin') await pool.query('UPDATE products SET is_pinned = TRUE WHERE wb_id = $1', [wbId]);
-  if (action === 'hide') await pool.query('UPDATE products SET is_active = FALSE WHERE wb_id = $1', [wbId]);
-  if (action === 'unhide') await pool.query('UPDATE products SET is_active = TRUE, is_pinned = FALSE WHERE wb_id = $1', [wbId]);
-  if (action === 'delete') await pool.query('DELETE FROM products WHERE wb_id = $1', [wbId]);
-  await sendMessage(msg.chat.id, `✅ Готово: <b>${exists.rows[0].name}</b>`, mainAdminKeyboard());
-  return true;
-}
-async function handlePromoCustom(msg) {
-  if (!awaitingPromoCustom.has(msg.from.id)) return false;
-  const state = awaitingPromoCustom.get(msg.from.id);
-  const text = msg.text.trim();
-  if (state.step === 'code') {
-    const code = text.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 20);
-    if (!code) { await sendMessage(msg.chat.id, '❌ Пустой'); return true; }
-    const dup = await pool.query('SELECT 1 FROM promo_codes WHERE code = $1', [code]);
-    if (dup.rows.length) { await sendMessage(msg.chat.id, '❌ Занят'); return true; }
-    state.code = code; state.step = 'tries';
-    awaitingPromoCustom.set(msg.from.id, state);
-    await sendMessage(msg.chat.id, 'Шаг 2/3: попыток (или «unlimited»):');
-    return true;
-  }
-  if (state.step === 'tries') {
-    let tries = 0, unlimited = false;
-    if (text.toLowerCase() === 'unlimited') unlimited = true;
-    else { tries = Number(text); if (!Number.isFinite(tries) || tries <= 0) { await sendMessage(msg.chat.id, '❌ Число > 0'); return true; } }
-    state.tries = tries; state.unlimited = unlimited; state.step = 'max_uses';
-    awaitingPromoCustom.set(msg.from.id, state);
-    await sendMessage(msg.chat.id, 'Шаг 3/3: лимит (0 = ∞):');
-    return true;
-  }
-  if (state.step === 'max_uses') {
-    const maxUses = Number(text);
-    if (!Number.isFinite(maxUses) || maxUses < 0) { await sendMessage(msg.chat.id, '❌ ≥ 0'); return true; }
-    await pool.query(`INSERT INTO promo_codes (code, tries, unlimited, max_uses, is_active, label) VALUES ($1, $2, $3, $4, TRUE, $5)`,
-      [state.code, state.tries, state.unlimited, maxUses === 0 ? 999999 : maxUses, state.unlimited ? 'Безлимит' : `+${state.tries}`]);
-    awaitingPromoCustom.delete(msg.from.id);
-    await sendMessage(msg.chat.id, `✅ Код: <code>${state.code}</code>`, { inline_keyboard: [[{ text: '🎁', callback_data: 'adm_promo' }]] });
-    return true;
-  }
-}
-
-// ============================================================
 // WEBHOOK
 // ============================================================
 app.post('/api/webhook/telegram', async (req, res) => {
@@ -1008,30 +420,10 @@ app.post('/api/webhook/telegram', async (req, res) => {
     });
     return res.sendStatus(200);
   }
-  if (update.callback_query) {
-    try { await handleCallback(update.callback_query); } catch (e) { console.error('[cb]', e.message); }
-    return res.sendStatus(200);
-  }
-  if (update.message?.text) {
-    const text = update.message.text.trim();
-    if (await handleBroadcastText(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handleUserSearch(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handleAddCustomText(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handleDM(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handleLinksDescText(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handleLinksText(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handleManualProductText(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handleProductAction(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handlePromoCustom(update.message).catch(() => false)) return res.sendStatus(200);
-    if (text === '/start') { await handleStart(update.message); return res.sendStatus(200); }
-    if (text === '/admin' || text === '/menu') { await handleAdminMenu(update.message); return res.sendStatus(200); }
-    return res.sendStatus(200);
-  }
   if (update.message?.successful_payment) {
     const pay = update.message.successful_payment;
     const parts = (pay.invoice_payload || '').split(':');
-    const productType = parts[0];
-    const tgId = Number(parts[1]);
+    const productType = parts[0]; const tgId = Number(parts[1]);
     const chargeId = pay.telegram_payment_charge_id;
     try {
       const dup = await pool.query('SELECT 1 FROM payments WHERE charge_id = $1', [chargeId]);
@@ -1055,9 +447,7 @@ app.post('/api/webhook/telegram', async (req, res) => {
 // ============================================================
 app.get('/', (_req, res) => res.send('GF Style Room API ✨'));
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
-
 cron.schedule('0 0,12 * * *', () => { refreshCatalog(); });
-cron.schedule('0 3 * * *', async () => { try { await pool.query('SELECT deleted_count FROM cleanup_old_products()'); } catch {} });
 pool.query('SELECT COUNT(*)::int AS c FROM products').then(r => { if (r.rows[0].c === 0) refreshCatalog(); }).catch(() => {});
 
 const PORT = process.env.PORT || 3000;
