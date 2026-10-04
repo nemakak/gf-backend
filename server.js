@@ -195,6 +195,7 @@ function logFalError(label, e) {
 }
 
 async function tryFashnV16(h, g) {
+  console.log(`[tryon] fashn-v1.6 input: model_image=${h.length}b, garment=${g.length}b`);
   return withTimeout(
     fal.subscribe('fal-ai/fashn/tryon/v1.6', {
       input: { model_image: h, garment_image: g, category: 'auto', mode: 'performance', acceleration: 'high' },
