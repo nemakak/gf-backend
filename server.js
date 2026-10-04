@@ -102,6 +102,7 @@ async function fetchWBProductInfo(wbId) {
 }
 function guessCategory(name) {
   const n = (name || '').toLowerCase();
+  if (/(осенн|демисезон|пальто|тренч|пуховик|дубленка|кожанк|бомбер|ветровка)/.test(n)) return 'autumn';
   if (/(пальто|тренч|пуховик|шуба|плащ|ветровка|бомбер|дубленка|кожанк|куртк|жилет)/.test(n)) return 'outerwear';
   if (/(костюм|комплект)/.test(n)) return 'suit';
   if (/(платье|сарафан|юбка)/.test(n)) return 'dress';
@@ -145,7 +146,7 @@ app.post('/api/auth', async (req, res) => {
 });
 
 // ============================================================
-// CATALOG (без аксессуаров)
+// CATALOG
 // ============================================================
 app.get('/api/catalog', async (req, res) => {
   try {
@@ -172,50 +173,41 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// FAL — 3 модели по очереди, никогда не бросает
+// FAL — 3 модели, никогда не бросает
 // ============================================================
-async function tryFashnV16(humanImg, garmentUrl) {
+async function tryFashnV16(h, g) {
   const r = await fal.subscribe('fal-ai/fashn/tryon/v1.6', {
-    input: { model_image: humanImg, garment_image: garmentUrl, category: 'auto', mode: 'performance', acceleration: 'high' },
-    logs: false,
-  });
+    input: { model_image: h, garment_image: g, category: 'auto', mode: 'performance', acceleration: 'high' }, logs: false });
   return r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
 }
-async function tryFashnV15(humanImg, garmentUrl) {
+async function tryFashnV15(h, g) {
   const r = await fal.subscribe('fal-ai/fashn/tryon/v1.5', {
-    input: { model_image: humanImg, garment_image: garmentUrl },
-    logs: false,
-  });
+    input: { model_image: h, garment_image: g }, logs: false });
   return r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
 }
-async function tryImageApps(humanImg, garmentUrl) {
+async function tryImageApps(h, g) {
   const r = await fal.subscribe('fal-ai/image-apps-v2/virtual-try-on', {
-    input: { person_image_url: humanImg, clothing_image_url: garmentUrl },
-    logs: false,
-  });
+    input: { person_image_url: h, clothing_image_url: g }, logs: false });
   return r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
 }
-
 async function runFalTryon({ humanImg, garmentUrl }) {
   const attempts = [
-    { name: 'fashn-v1.6', fn: () => tryFashnV16(humanImg, garmentUrl) },
-    { name: 'fashn-v1.5', fn: () => tryFashnV15(humanImg, garmentUrl) },
+    { name: 'fashn-v1.6',    fn: () => tryFashnV16(humanImg, garmentUrl) },
+    { name: 'fashn-v1.5',    fn: () => tryFashnV15(humanImg, garmentUrl) },
     { name: 'image-apps-v2', fn: () => tryImageApps(humanImg, garmentUrl) },
   ];
   for (const a of attempts) {
     try {
       const url = await a.fn();
-      if (url) { console.log(`[tryon] ✅ ${a.name}`); return { url, model: a.name }; }
+      if (url) { console.log(`[tryon] OK ${a.name}`); return { url, model: a.name }; }
       console.warn(`[tryon] ${a.name} empty`);
-    } catch (e) {
-      console.warn(`[tryon] ❌ ${a.name}: ${e.message}`);
-    }
+    } catch (e) { console.warn(`[tryon] FAIL ${a.name}: ${e.message}`); }
   }
   return { url: null, model: null };
 }
 
 // ============================================================
-// TRYON — списание только при успехе
+// TRYON
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
   const t0 = Date.now();
@@ -223,41 +215,32 @@ app.post('/api/tryon', async (req, res) => {
   const tgUser = verifyTelegramInitData(initData);
   if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
   const tgId = tgUser.id;
-
   if (!humanImg || !garmentUrl) return res.status(400).json({ error: 'Нет фото или товара' });
-
   try {
     const u = await pool.query('SELECT * FROM users WHERE tg_id = $1', [tgId]);
     if (!u.rows.length) return res.status(404).json({ error: 'User not found' });
     const user = u.rows[0];
     const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
-
     if (!hasUnlimited && user.balance <= 0) return res.status(402).json({ error: 'Нет попыток' });
 
     const { url: resultUrl, model } = await runFalTryon({ humanImg, garmentUrl });
-
     if (!resultUrl) {
-      console.warn(`[tryon] all models failed (${Date.now() - t0}ms) — НЕ списано`);
+      console.warn(`[tryon] all failed (${Date.now() - t0}ms) — НЕ списано`);
       return res.json({ success: false, error: 'Не удалось сгенерировать. Попытки не списаны.' });
     }
-
     if (!hasUnlimited) await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
-
     const snap = itemId ? (await pool.query('SELECT wb_id, name, image_url FROM products WHERE id = $1', [itemId])).rows[0] || {} : {};
-
     await pool.query(
       `INSERT INTO tryon_history (user_id, product_id, product_wb_id, product_name, product_image, result_url, is_mock, category)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [tgId, itemId ? Number(itemId) : null, snap.wb_id || null, snap.name || null, snap.image_url || null, resultUrl, false, category || null]
     );
-
     if (user.ref_by && !user.ref_rewarded) {
       await pool.query('UPDATE users SET ref_rewarded = TRUE WHERE tg_id = $1', [tgId]);
       await pool.query('UPDATE users SET balance = balance + 3 WHERE tg_id = $1', [user.ref_by]);
       sendMessage(user.ref_by, '🎉 Твоя подруга сделала первую примерку! +3 попытки ✨').catch(() => {});
     }
-
-    console.log(`[tryon] OK ${model} (${Date.now() - t0}ms) — списано`);
+    console.log(`[tryon] OK ${model} (${Date.now() - t0}ms)`);
     res.json({ success: true, resultUrl, model, took: Date.now() - t0 });
   } catch (e) {
     console.error('[tryon]', e.message);
@@ -266,7 +249,54 @@ app.post('/api/tryon', async (req, res) => {
 });
 
 // ============================================================
-// MULTI — только 2–3 вещи, разные категории
+// TRYON BY LINK
+// ============================================================
+app.post('/api/tryon-by-link', async (req, res) => {
+  const t0 = Date.now();
+  const { initData, humanImg, wbLink } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  const tgId = tgUser.id;
+  if (!humanImg || !wbLink) return res.status(400).json({ error: 'Нужно фото и ссылка' });
+  const ids = extractWbIds(wbLink);
+  if (!ids.length) return res.status(400).json({ error: 'Не нашёл артикул в ссылке' });
+  const wbId = ids[0];
+  try {
+    const u = await pool.query('SELECT * FROM users WHERE tg_id = $1', [tgId]);
+    if (!u.rows.length) return res.status(404).json({ error: 'User not found' });
+    const user = u.rows[0];
+    const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
+    if (!hasUnlimited && (user.own_tries || 0) <= 0) return res.status(402).json({ error: 'Нет попыток для своих товаров' });
+
+    const info = await fetchWBProductInfo(wbId);
+    const garmentUrl = primaryImageUrl(wbId);
+    const productName = info?.name || `Товар ${wbId}`;
+    const { url: resultUrl } = await runFalTryon({ humanImg, garmentUrl });
+    if (!resultUrl) {
+      console.warn(`[tryon-by-link] failed (${Date.now() - t0}ms)`);
+      return res.json({ success: false, error: 'Не удалось сгенерировать. Попытки не списаны.' });
+    }
+    if (!hasUnlimited) await pool.query('UPDATE users SET own_tries = own_tries - 1 WHERE tg_id = $1', [tgId]);
+    await pool.query(
+      `INSERT INTO tryon_history (user_id, product_wb_id, product_name, product_image, result_url, is_mock)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [tgId, wbId, productName, garmentUrl, resultUrl, false]
+    );
+    try {
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: tgId, photo: resultUrl, caption: '✨ Твоя примерка готова!' }),
+      });
+    } catch {}
+    res.json({ success: true, resultUrl, productName, took: Date.now() - t0 });
+  } catch (e) {
+    console.error('[tryon-by-link]', e.message);
+    res.json({ success: false, error: 'Ошибка. Попытки не списаны.' });
+  }
+});
+
+// ============================================================
+// MULTI 2–3 разных категорий
 // ============================================================
 app.post('/api/tryon-multi', async (req, res) => {
   const t0 = Date.now();
@@ -274,56 +304,32 @@ app.post('/api/tryon-multi', async (req, res) => {
   const tgUser = verifyTelegramInitData(initData);
   if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
   const tgId = tgUser.id;
-
-  if (!Array.isArray(items) || items.length < 2 || items.length > 3) {
-    return res.status(400).json({ error: 'Нужно 2–3 вещи' });
-  }
-  // Проверка: все категории разные
+  if (!Array.isArray(items) || items.length < 2 || items.length > 3) return res.status(400).json({ error: 'Нужно 2–3 вещи' });
   const cats = items.map(i => i.category);
-  const uniq = new Set(cats);
-  if (uniq.size !== cats.length) {
-    return res.status(400).json({ error: 'Выберите вещи из разных категорий (нельзя два верха, два низа и т.д.)' });
-  }
-
+  if (new Set(cats).size !== cats.length) return res.status(400).json({ error: 'Выберите вещи из разных категорий' });
   try {
     const u = await pool.query('SELECT * FROM users WHERE tg_id = $1', [tgId]);
     if (!u.rows.length) return res.status(404).json({ error: 'User not found' });
     const user = u.rows[0];
     const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
     const need = items.length;
-    if (!hasUnlimited && user.balance < need) {
-      return res.status(402).json({ error: `Нужно ${need} попыток (у вас ${user.balance})` });
-    }
+    if (!hasUnlimited && user.balance < need) return res.status(402).json({ error: `Нужно ${need} попыток` });
 
-    const results = [];
-    let prevImg = humanImg;
-    let success = 0;
+    const results = []; let prevImg = humanImg; let success = 0;
     for (const item of items) {
       const { url } = await runFalTryon({ humanImg: prevImg, garmentUrl: item.image_url });
       if (url) { results.push({ itemId: item.id, name: item.name, url }); prevImg = url; success++; }
       else results.push({ itemId: item.id, name: item.name, url: null });
     }
-
-    if (!hasUnlimited && success > 0) {
-      await pool.query('UPDATE users SET balance = GREATEST(0, balance - $1) WHERE tg_id = $2', [success, tgId]);
-    }
-
+    if (!hasUnlimited && success > 0) await pool.query('UPDATE users SET balance = GREATEST(0, balance - $1) WHERE tg_id = $2', [success, tgId]);
     for (const r of results) {
-      if (r.url) {
-        await pool.query(
-          `INSERT INTO tryon_history (user_id, product_id, product_name, result_url, is_mock)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [tgId, r.itemId || null, r.name || null, r.url, false]
-        );
-      }
+      if (r.url) await pool.query(
+        `INSERT INTO tryon_history (user_id, product_id, product_name, result_url, is_mock)
+         VALUES ($1,$2,$3,$4,$5)`, [tgId, r.itemId || null, r.name || null, r.url, false]);
     }
-
-    if (success === 0) return res.json({ success: false, error: 'Не удалось сгенерировать. Попытки не списаны.' });
+    if (success === 0) return res.json({ success: false, error: 'Не удалось. Попытки не списаны.' });
     res.json({ success: true, results, charged: success, took: Date.now() - t0 });
-  } catch (e) {
-    console.error('[tryon-multi]', e.message);
-    res.json({ success: false, error: 'Ошибка. Попытки не списаны.' });
-  }
+  } catch (e) { console.error('[tryon-multi]', e.message); res.json({ success: false, error: 'Ошибка. Попытки не списаны.' }); }
 });
 
 // ============================================================
@@ -358,9 +364,9 @@ app.post('/api/redeem-promo', async (req, res) => {
     const promo = await pool.query(`SELECT * FROM promo_codes WHERE code = $1 AND is_active = TRUE AND (expires_at IS NULL OR expires_at > NOW())`, [cleanCode]);
     if (!promo.rows.length) return res.status(404).json({ error: 'Промокод не найден' });
     const p = promo.rows[0];
-    if (p.used_count >= p.max_uses) return res.status(400).json({ error: 'Промокод больше не действует' });
+    if (p.used_count >= p.max_uses) return res.status(400).json({ error: 'Не действует' });
     const used = await pool.query('SELECT 1 FROM promo_uses WHERE code = $1 AND tg_id = $2', [cleanCode, tgId]);
-    if (used.rows.length) return res.status(400).json({ error: 'Вы уже использовали этот промокод' });
+    if (used.rows.length) return res.status(400).json({ error: 'Уже использовали' });
     await pool.query('INSERT INTO promo_uses (code, tg_id) VALUES ($1, $2)', [cleanCode, tgId]);
     await pool.query('UPDATE promo_codes SET used_count = used_count + 1 WHERE code = $1', [cleanCode]);
     if (p.unlimited) {
@@ -370,6 +376,31 @@ app.post('/api/redeem-promo', async (req, res) => {
     await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [p.tries, tgId]);
     res.json({ success: true, tries: p.tries, unlimited: false });
   } catch { res.status(500).json({ error: 'Server error' }); }
+});
+
+// ============================================================
+// IDEA
+// ============================================================
+app.post('/api/idea', async (req, res) => {
+  const { initData, text } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  const clean = String(text || '').trim().slice(0, 2000);
+  if (!clean) return res.status(400).json({ error: 'Пусто' });
+  try {
+    await pool.query(
+      `INSERT INTO ideas (tg_id, first_name, username, text) VALUES ($1,$2,$3,$4)`,
+      [tgUser.id, tgUser.first_name || null, tgUser.username || null, clean]
+    );
+    const admins = await pool.query('SELECT tg_id FROM users WHERE is_admin = TRUE');
+    const from = `${tgUser.first_name || '—'} @${tgUser.username || '—'} · <code>${tgUser.id}</code>`;
+    for (const a of admins.rows) {
+      sendMessage(a.tg_id,
+        `💡 <b>Новая идея</b>\n\n👤 От: ${from}\n\n📝 ${clean.replace(/</g, '&lt;')}`
+      ).catch(() => {});
+    }
+    res.json({ success: true });
+  } catch (e) { console.error('[idea]', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.post('/api/onboarded', async (req, res) => {
@@ -385,7 +416,7 @@ app.post('/api/onboarded', async (req, res) => {
 // ============================================================
 app.post('/api/create-invoice', async (req, res) => {
   const { tgId, productType, tries, ownTries } = req.body;
-  let title = '10 примерок одежды', amount = 50;
+  let title = '10 примерок', amount = 50;
   let payload = `pack10:${tgId}:${Date.now()}`;
   if (SUBSCRIPTIONS[productType]) {
     const sub = SUBSCRIPTIONS[productType]; title = sub.title; amount = sub.stars;
