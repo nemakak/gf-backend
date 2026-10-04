@@ -257,25 +257,9 @@ async function fetchImageAsBase64(url) {
   }
 }
 
-async function tryFashnV16(h, g) {
-  console.log(`[tryon] fashn-v1.6 → model=${h.length}b, garment=${g.length}b`);
-  return withTimeout(
-    fal.subscribe('fal-ai/fashn/tryon/v1.6', {
-      input: { model_image: h, garment_image: g, category: 'auto', mode: 'performance', acceleration: 'high' },
-      logs: false,
-    }).then(r => r?.data?.image?.url || r?.data?.images?.[0]?.url || null),
-    30000, 'fashn-v1.6'
-  );
-}
-async function tryImageApps(h, g) {
-  return withTimeout(
-    fal.subscribe('fal-ai/image-apps-v2/virtual-try-on', {
-      input: { person_image_url: h, clothing_image_url: g }, logs: false,
-    }).then(r => r?.data?.image?.url || r?.data?.images?.[0]?.url || null),
-    30000, 'image-apps-v2'
-  );
-}
-
+// ============================================================
+// TRYON — дешёвая модель первой (15с), дорогая резервом (20с)
+// ============================================================
 async function runFalTryon({ humanImg, garmentUrl }) {
   let cleanGarmentUrl = garmentUrl;
   if (typeof cleanGarmentUrl === 'string') {
@@ -299,22 +283,46 @@ async function runFalTryon({ humanImg, garmentUrl }) {
     }
   }
 
-  const attempts = [
-    { name: 'fashn-v1.6',    fn: () => tryFashnV16(humanImg, garmentData) },
-    { name: 'image-apps-v2', fn: () => tryImageApps(humanImg, garmentData) },
-  ];
-  for (const a of attempts) {
-    const t = Date.now();
-    try {
-      const url = await a.fn();
-      if (url) { console.log(`[tryon] OK ${a.name} за ${Date.now() - t}ms`); return { url, model: a.name }; }
-    } catch (e) { logFalError(a.name, e); }
-  }
+  const t0 = Date.now();
+
+  // ШАГ 1: дешёвая image-apps-v2 ($0.04), таймаут 15 сек
+  console.log('[tryon] шаг 1: image-apps-v2 (15s, $0.04)');
+  try {
+    const url = await withTimeout(
+      fal.subscribe('fal-ai/image-apps-v2/virtual-try-on', {
+        input: { person_image_url: humanImg, clothing_image_url: garmentData },
+        logs: false,
+      }).then(r => r?.data?.image?.url || r?.data?.images?.[0]?.url || null),
+      15000, 'image-apps-v2'
+    );
+    if (url) {
+      console.log(`[tryon] ✅ image-apps-v2 OK за ${Date.now() - t0}ms`);
+      return { url, model: 'image-apps-v2' };
+    }
+  } catch (e) { logFalError('image-apps-v2', e); }
+
+  // ШАГ 2: дорогая fashn-v1.6 ($0.075), таймаут 20 сек
+  console.log('[tryon] шаг 2: fashn-v1.6 (20s, $0.075, резерв)');
+  try {
+    const url = await withTimeout(
+      fal.subscribe('fal-ai/fashn/tryon/v1.6', {
+        input: { model_image: humanImg, garment_image: garmentData, category: 'auto', mode: 'performance', acceleration: 'high' },
+        logs: false,
+      }).then(r => r?.data?.image?.url || r?.data?.images?.[0]?.url || null),
+      20000, 'fashn-v1.6'
+    );
+    if (url) {
+      console.log(`[tryon] ✅ fashn-v1.6 OK за ${Date.now() - t0}ms (был резерв)`);
+      return { url, model: 'fashn-v1.6' };
+    }
+  } catch (e) { logFalError('fashn-v1.6', e); }
+
+  console.warn(`[tryon] все упали за ${Date.now() - t0}ms — НЕ списано`);
   return { url: null, model: null };
 }
 
 // ============================================================
-// TRYON
+// TRYON ENDPOINT
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
   const t0 = Date.now();
@@ -347,7 +355,7 @@ app.post('/api/tryon', async (req, res) => {
       await pool.query('UPDATE users SET balance = balance + 3 WHERE tg_id = $1', [user.ref_by]);
       sendMessage(user.ref_by, '🎉 Твоя подруга сделала первую примерку! +3 попытки ✨').catch(() => {});
     }
-    console.log(`[tryon] готово за ${Date.now() - t0}ms`);
+    console.log(`[tryon] готово за ${Date.now() - t0}ms (${model})`);
     res.json({ success: true, resultUrl, model, took: Date.now() - t0 });
   } catch (e) {
     logError('tryon', e.message);
@@ -421,7 +429,7 @@ app.post('/api/tryon-multi', async (req, res) => {
 });
 
 // ============================================================
-// HISTORY / PROMO / IDEA / ONBOARDED
+// HISTORY / PROMO / IDEA / ONBOARDED / INVOICE
 // ============================================================
 app.post('/api/history', async (req, res) => {
   const { initData } = req.body;
@@ -523,11 +531,9 @@ async function checkBrokenProducts() {
   try {
     const r = await pool.query(`SELECT id, wb_id, name FROM products WHERE is_active = TRUE`);
     const rows = r.rows;
-    console.log(`[cleanup] товаров для проверки: ${rows.length}`);
-
+    console.log(`[cleanup] товаров: ${rows.length}`);
     let checked = 0, broken = 0;
     const brokenList = [];
-
     const CONCURRENCY = 10;
     for (let i = 0; i < rows.length; i += CONCURRENCY) {
       const chunk = rows.slice(i, i + CONCURRENCY);
@@ -535,32 +541,20 @@ async function checkBrokenProducts() {
         checked++;
         try {
           const imgUrl = primaryImageUrl(row.wb_id);
-          let res = await fetch(imgUrl, {
-            method: 'HEAD',
-            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' },
-            timeout: 5000,
-          });
+          let res = await fetch(imgUrl, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' }, timeout: 5000 });
           if (!res.ok) {
             const altUrl = fallbackImageUrl(row.wb_id);
-            res = await fetch(altUrl, {
-              method: 'HEAD',
-              headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' },
-              timeout: 5000,
-            });
+            res = await fetch(altUrl, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' }, timeout: 5000 });
             if (!res.ok) {
               await pool.query(`UPDATE products SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [row.id]);
               broken++;
               brokenList.push(`${row.wb_id} — ${(row.name || '').slice(0, 40)}`);
             }
           }
-        } catch (e) {
-          console.warn(`[cleanup] ${row.wb_id}: ${e.message}`);
-        }
+        } catch (e) { console.warn(`[cleanup] ${row.wb_id}: ${e.message}`); }
       }));
     }
-
     console.log(`[cleanup] готово ${Date.now() - t0}ms. Проверено: ${checked}, скрыто: ${broken}`);
-
     const admins = await pool.query('SELECT tg_id FROM users WHERE is_admin = TRUE');
     if (broken > 0) {
       await logError('cleanup', `Скрыто битых: ${broken}`, brokenList.slice(0, 30).join('\n'));
@@ -821,17 +815,11 @@ async function handleCallback(cb) {
     awaitingLinkForAdd.add(userId);
     return editMessage(chatId, messageId, `➕ Пришли <b>ссылку WB</b>:`, { inline_keyboard: [[{ text: '❌', callback_data: 'adm_catalog' }]] });
   }
-
-  // === ПРОВЕРКА В ФОНЕ ===
   if (data === 'adm_check_products') {
     editMessage(chatId, messageId, '🧹 Проверка запущена в фоне.\n\nРезультат придёт уведомлением.', backKb).catch(() => {});
-    setImmediate(() => {
-      checkBrokenProducts().catch(e => logError('cleanup-bg', e.message));
-    });
+    setImmediate(() => { checkBrokenProducts().catch(e => logError('cleanup-bg', e.message)); });
     return;
   }
-
-  // === УДАЛЕНИЕ В ФОНЕ ===
   if (data === 'adm_delete_broken') {
     editMessage(chatId, messageId, '🗑 Удаляю нерабочие в фоне.\n\nРезультат придёт уведомлением.', backKb).catch(() => {});
     setImmediate(async () => {
@@ -865,7 +853,6 @@ async function handleCallback(cb) {
     });
     return;
   }
-
   if (['adm_pin', 'adm_hide', 'adm_unhide', 'adm_delete'].includes(data)) {
     const action = data.replace('adm_', '');
     awaitingProductAction.set(userId, action);
@@ -876,9 +863,8 @@ async function handleCallback(cb) {
     await editMessage(chatId, messageId, '🔄 Обновляю…', backKb);
     try {
       const r = await pool.query(`SELECT id, wb_id FROM products WHERE name LIKE 'Товар WB%' OR name IS NULL OR TRIM(name) = '' ORDER BY id DESC LIMIT 300`);
-      console.log(`[backfill] товаров для обновления: ${r.rows.length}`);
       if (!r.rows.length) {
-        await sendMessage(chatId, `ℹ️ Нет товаров с заглушками — все названия уже нормальные.`, backKb);
+        await sendMessage(chatId, `ℹ️ Нет товаров с заглушками.`, backKb);
         return;
       }
       let updated = 0, failed = 0;
@@ -889,20 +875,14 @@ async function handleCallback(cb) {
           await pool.query(`UPDATE products SET name=$1, price=COALESCE($2, price), description=COALESCE(description, $3), updated_at=NOW() WHERE id=$4`,
             [info.name, info.price, info.description || info.name, row.id]);
           updated++;
-        } else {
-          failed++;
-          fails.push(row.wb_id);
-        }
+        } else { failed++; fails.push(row.wb_id); }
         await new Promise(rs => setTimeout(rs, 250));
       }
       await sendMessage(chatId,
         `✅ <b>Обновлено:</b> ${updated}\n❌ <b>Не удалось:</b> ${failed}\n\n` +
-        (fails.length ? `Не найденные ID: ${fails.slice(0, 10).join(', ')}${fails.length > 10 ? '…' : ''}` : ''),
+        (fails.length ? `Не найденные ID: ${fails.slice(0, 10).join(', ')}` : ''),
         backKb);
-    } catch (e) {
-      logError('backfill', e.message);
-      await sendMessage(chatId, '❌ ' + e.message, backKb);
-    }
+    } catch (e) { logError('backfill', e.message); await sendMessage(chatId, '❌ ' + e.message, backKb); }
     return;
   }
   if (data === 'adm_cleanup') {
