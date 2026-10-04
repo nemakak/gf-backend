@@ -174,23 +174,54 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// FAL
+// FAL с таймаутом и подробным логированием
 // ============================================================
+async function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: timeout ${ms}ms`)), ms)),
+  ]);
+}
+
+function logFalError(label, e) {
+  console.warn(`[tryon] FAIL ${label}: ${e.message || '(пустая ошибка)'}`);
+  try {
+    console.warn(`[tryon] DETAIL:`, JSON.stringify({
+      name: e.name, message: e.message, code: e.code, status: e.status,
+      response: e.response?.data || e.response?.body || null,
+      cause: e.cause?.message || null,
+    }));
+  } catch { console.warn('[tryon] DETAIL: (не удалось сериализовать)'); }
+}
+
 async function tryFashnV16(h, g) {
-  const r = await fal.subscribe('fal-ai/fashn/tryon/v1.6', {
-    input: { model_image: h, garment_image: g, category: 'auto', mode: 'performance', acceleration: 'high' }, logs: false });
-  return r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
+  return withTimeout(
+    fal.subscribe('fal-ai/fashn/tryon/v1.6', {
+      input: { model_image: h, garment_image: g, category: 'auto', mode: 'performance', acceleration: 'high' },
+      logs: false,
+    }).then(r => r?.data?.image?.url || r?.data?.images?.[0]?.url || null),
+    60000, 'fashn-v1.6'
+  );
 }
 async function tryFashnV15(h, g) {
-  const r = await fal.subscribe('fal-ai/fashn/tryon/v1.5', {
-    input: { model_image: h, garment_image: g }, logs: false });
-  return r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
+  return withTimeout(
+    fal.subscribe('fal-ai/fashn/tryon/v1.5', {
+      input: { model_image: h, garment_image: g },
+      logs: false,
+    }).then(r => r?.data?.image?.url || r?.data?.images?.[0]?.url || null),
+    60000, 'fashn-v1.5'
+  );
 }
 async function tryImageApps(h, g) {
-  const r = await fal.subscribe('fal-ai/image-apps-v2/virtual-try-on', {
-    input: { person_image_url: h, clothing_image_url: g }, logs: false });
-  return r?.data?.image?.url || r?.data?.images?.[0]?.url || null;
+  return withTimeout(
+    fal.subscribe('fal-ai/image-apps-v2/virtual-try-on', {
+      input: { person_image_url: h, clothing_image_url: g },
+      logs: false,
+    }).then(r => r?.data?.image?.url || r?.data?.images?.[0]?.url || null),
+    60000, 'image-apps-v2'
+  );
 }
+
 async function runFalTryon({ humanImg, garmentUrl }) {
   const attempts = [
     { name: 'fashn-v1.6',    fn: () => tryFashnV16(humanImg, garmentUrl) },
@@ -201,8 +232,8 @@ async function runFalTryon({ humanImg, garmentUrl }) {
     try {
       const url = await a.fn();
       if (url) { console.log(`[tryon] OK ${a.name}`); return { url, model: a.name }; }
-      console.warn(`[tryon] ${a.name} empty`);
-    } catch (e) { console.warn(`[tryon] FAIL ${a.name}: ${e.message}`); }
+      console.warn(`[tryon] ${a.name} вернул пусто`);
+    } catch (e) { logFalError(a.name, e); }
   }
   return { url: null, model: null };
 }
@@ -226,7 +257,7 @@ app.post('/api/tryon', async (req, res) => {
 
     const { url: resultUrl, model } = await runFalTryon({ humanImg, garmentUrl });
     if (!resultUrl) {
-      console.warn(`[tryon] all failed (${Date.now() - t0}ms)`);
+      console.warn(`[tryon] all failed (${Date.now() - t0}ms) — НЕ списано`);
       return res.json({ success: false, error: 'Не удалось сгенерировать. Попытки не списаны.' });
     }
     if (!hasUnlimited) await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
@@ -268,9 +299,7 @@ app.post('/api/tryon-by-link', async (req, res) => {
     const garmentUrl = primaryImageUrl(wbId);
     const productName = info?.name || `Товар ${wbId}`;
     const { url: resultUrl } = await runFalTryon({ humanImg, garmentUrl });
-    if (!resultUrl) {
-      return res.json({ success: false, error: 'Не удалось сгенерировать. Попытки не списаны.' });
-    }
+    if (!resultUrl) return res.json({ success: false, error: 'Не удалось сгенерировать. Попытки не списаны.' });
     if (!hasUnlimited) await pool.query('UPDATE users SET own_tries = own_tries - 1 WHERE tg_id = $1', [tgId]);
     await pool.query(
       `INSERT INTO tryon_history (user_id, product_wb_id, product_name, product_image, result_url, is_mock)
@@ -383,9 +412,7 @@ app.post('/api/idea', async (req, res) => {
     const admins = await pool.query('SELECT tg_id FROM users WHERE is_admin = TRUE');
     const from = `${tgUser.first_name || '—'} @${tgUser.username || '—'} · <code>${tgUser.id}</code>`;
     for (const a of admins.rows) {
-      sendMessage(a.tg_id,
-        `💡 <b>Новая идея</b>\n\n👤 От: ${from}\n\n📝 ${clean.replace(/</g, '&lt;')}`
-      ).catch(() => {});
+      sendMessage(a.tg_id, `💡 <b>Новая идея</b>\n\n👤 От: ${from}\n\n📝 ${clean.replace(/</g, '&lt;')}`).catch(() => {});
     }
     res.json({ success: true });
   } catch (e) { console.error('[idea]', e.message); res.status(500).json({ error: 'Server error' }); }
@@ -425,10 +452,8 @@ app.post('/api/create-invoice', async (req, res) => {
 });
 
 // ============================================================
-// АДМИНКА — новая интуитивная
+// АДМИНКА
 // ============================================================
-
-// Главное меню
 function mainAdminKeyboard() {
   return {
     inline_keyboard: [
@@ -442,8 +467,6 @@ function mainAdminKeyboard() {
     ],
   };
 }
-
-// Меню «Каталог»
 function catalogMenuKeyboard() {
   return {
     inline_keyboard: [
@@ -458,8 +481,6 @@ function catalogMenuKeyboard() {
     ],
   };
 }
-
-// Меню «Промокоды»
 function promoMenuKeyboard() {
   return {
     inline_keyboard: [
@@ -475,8 +496,6 @@ function promoMenuKeyboard() {
     ],
   };
 }
-
-// Меню «Пользователи»
 function usersMenuKeyboard() {
   return {
     inline_keyboard: [
@@ -488,15 +507,13 @@ function usersMenuKeyboard() {
     ],
   };
 }
-
-// Меню действий с юзером
 function userActionsKeyboard(tgId) {
   return {
     inline_keyboard: [
       [{ text: '🎁 +5 попыток', callback_data: `usr_add_5_${tgId}` }, { text: '🎁 +10', callback_data: `usr_add_10_${tgId}` }],
       [{ text: '🎁 +25', callback_data: `usr_add_25_${tgId}` }, { text: '🎁 +50', callback_data: `usr_add_50_${tgId}` }],
       [{ text: '✏️ Своё число попыток', callback_data: `usr_add_custom_${tgId}` }],
-      [{ text: '📦 +5 своих примерок', callback_data: `usr_addown_5_${tgId}` }, { text: '📦 +10', callback_data: `usr_addown_10_${tgId}` }],
+      [{ text: '📦 +5 своих', callback_data: `usr_addown_5_${tgId}` }, { text: '📦 +10 своих', callback_data: `usr_addown_10_${tgId}` }],
       [{ text: '🔄 Обнулить баланс', callback_data: `usr_reset_${tgId}` }],
       [{ text: '♾ Безлимит 24ч', callback_data: `usr_unlimit_${tgId}` }, { text: '❌ Снять', callback_data: `usr_unlimit_off_${tgId}` }],
       [{ text: '💎 Сделать админом', callback_data: `usr_admin_on_${tgId}` }, { text: '❌ Снять админа', callback_data: `usr_admin_off_${tgId}` }],
@@ -507,13 +524,10 @@ function userActionsKeyboard(tgId) {
   };
 }
 
-// Состояния
 const awaitingBroadcast = new Set();
 const awaitingUserSearch = new Set();
 const awaitingAddCustom = new Map();
-const awaitingAddOwn = new Map();
 const awaitingLinkForAdd = new Set();
-const awaitingDescAfterLink = new Map();
 const awaitingPromoCustom = new Map();
 const awaitingProductAction = new Map();
 const awaitingDM = new Map();
@@ -525,12 +539,9 @@ function randomCode(len = 6) {
   return s;
 }
 
-// START — определяет роль
 async function handleStart(msg) {
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const admin = await isAdmin(userId);
-
+  const admin = await isAdmin(msg.from.id);
   if (admin) {
     await sendMessage(chatId, '👑 <b>Админ-панель Style Room</b>\n\nВыбери раздел:', mainAdminKeyboard());
   } else {
@@ -553,17 +564,15 @@ async function handleCallback(cb) {
   const backKb = { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]] };
 
   if (data === 'adm_back') return back();
-
   if (data === 'adm_help') {
     return editMessage(chatId, messageId,
-      `❓ <b>Помощь по админке</b>\n\n` +
+      `❓ <b>Помощь</b>\n\n` +
       `<b>📊 Статистика</b> — юзеры, примерки, товары.\n\n` +
-      `<b>👥 Пользователи</b> — список, карточка юзера с действиями.\n\n` +
-      `<b>🎁 Выдать попытки</b> — быстро найти юзера по @username или ID и начислить ему попытки.\n\n` +
-      `<b>🎟 Промокоды</b> — создание кодов на попытки/безлимит.\n\n` +
-      `<b>🛍 Каталог</b> — добавление товара по ссылке WB (всё подтянется автоматически), закрепить/скрыть/удалить.\n\n` +
-      `<b>📢 Рассылка</b> — сообщение всем юзерам.\n\n` +
-      `💡 В любом месте, где нужен артикул — можно просто прислать <b>ссылку WB</b>.`,
+      `<b>👥 Пользователи</b> — список, карточка юзера.\n\n` +
+      `<b>🎁 Выдать попытки</b> — по @username или ID.\n\n` +
+      `<b>🎟 Промокоды</b> — быстрые и свои.\n\n` +
+      `<b>🛍 Каталог</b> — товар добавляется по одной ссылке WB, всё подтягивается автоматически.\n\n` +
+      `<b>📢 Рассылка</b> — всем юзерам.`,
       backKb);
   }
 
@@ -587,10 +596,7 @@ async function handleCallback(cb) {
   if (data === 'adm_give_tries') {
     awaitingUserSearch.add(userId);
     return editMessage(chatId, messageId,
-      `🎁 <b>Выдать попытки</b>\n\n` +
-      `Пришли одним сообщением:\n` +
-      `• <b>@username</b> юзера — например <code>@ivan</code>\n` +
-      `• Или <b>ID</b> — например <code>1068105255</code>`,
+      `🎁 <b>Выдать попытки</b>\n\nПришли <b>@username</b> или <b>ID</b>:`,
       { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_back' }]] });
   }
 
@@ -620,11 +626,10 @@ async function handleCallback(cb) {
   }
   if (data.startsWith('usr_show_')) return showUserCard(chatId, messageId, Number(data.replace('usr_show_', '')));
 
-  // Быстрые действия с юзером
   if (data.startsWith('usr_add_custom_')) {
     const tgId = Number(data.replace('usr_add_custom_', ''));
     awaitingAddCustom.set(userId, tgId);
-    return editMessage(chatId, messageId, '✏️ Сколько попыток начислить? (можно число):', { inline_keyboard: [[{ text: '❌', callback_data: `usr_show_${tgId}` }]] });
+    return editMessage(chatId, messageId, '✏️ Сколько попыток?', { inline_keyboard: [[{ text: '❌', callback_data: `usr_show_${tgId}` }]] });
   }
   if (/^usr_add_\d+_\d+$/.test(data)) {
     const [, , count, tgId] = data.split('_');
@@ -674,16 +679,12 @@ async function handleCallback(cb) {
 
   // ===== КАТАЛОГ =====
   if (data === 'adm_catalog') return editMessage(chatId, messageId, '🛍 <b>Каталог</b>', catalogMenuKeyboard());
-
   if (data === 'adm_add_link') {
     awaitingLinkForAdd.add(userId);
     return editMessage(chatId, messageId,
-      `➕ <b>Добавить товар</b>\n\n` +
-      `Пришли <b>ссылку WB</b> (или несколько, по одной на строку).\n\n` +
-      `Название, цена и картинка подтянутся <b>автоматически</b>.`,
+      `➕ <b>Добавить товар</b>\n\nПришли <b>ссылку WB</b> (можно несколько, по одной на строку).\n\nНазвание, цена и картинка подтянутся автоматически.`,
       { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_catalog' }]] });
   }
-
   if (['adm_pin', 'adm_hide', 'adm_unhide', 'adm_delete'].includes(data)) {
     const action = data.replace('adm_', '');
     awaitingProductAction.set(userId, action);
@@ -695,7 +696,6 @@ async function handleCallback(cb) {
     };
     return editMessage(chatId, messageId, prompts[action], { inline_keyboard: [[{ text: '❌', callback_data: 'adm_catalog' }]] });
   }
-
   if (data === 'adm_backfill') {
     return editMessage(chatId, messageId, '🔄 Обновляю названия…', backKb).then(async () => {
       try {
@@ -713,7 +713,6 @@ async function handleCallback(cb) {
       } catch (e) { await sendMessage(chatId, '❌ ' + e.message, backKb); }
     });
   }
-
   if (data === 'adm_cleanup') {
     try {
       const r = await pool.query('SELECT deleted_count FROM cleanup_old_products()');
@@ -725,7 +724,7 @@ async function handleCallback(cb) {
   if (data === 'adm_promo') return editMessage(chatId, messageId, '🎟 <b>Промокоды</b>', promoMenuKeyboard());
   if (data === 'adm_promo_custom') {
     awaitingPromoCustom.set(userId, { step: 'code' });
-    return editMessage(chatId, messageId, '🎟 Шаг 1/3: введи код (латиница/цифры):', { inline_keyboard: [[{ text: '❌', callback_data: 'adm_promo' }]] });
+    return editMessage(chatId, messageId, '🎟 Шаг 1/3: введи код:', { inline_keyboard: [[{ text: '❌', callback_data: 'adm_promo' }]] });
   }
   if (data.startsWith('adm_promo_quick_')) {
     const type = data.replace('adm_promo_quick_', '');
@@ -781,7 +780,6 @@ async function showUserCard(chatId, messageId, tgId, toast = null) {
   } catch (e) { return messageId ? editMessage(chatId, messageId, '❌ ' + e.message) : sendMessage(chatId, '❌ ' + e.message); }
 }
 
-// ===== TEXT HANDLERS =====
 async function handleBroadcastText(msg) {
   if (!awaitingBroadcast.has(msg.from.id)) return false;
   awaitingBroadcast.delete(msg.from.id);
@@ -820,15 +818,11 @@ async function handleDM(msg) {
   catch (e) { await sendMessage(msg.chat.id, '❌ ' + e.message, mainAdminKeyboard()); }
   return true;
 }
-
-// ==== ДОБАВЛЕНИЕ ТОВАРА ПО ССЫЛКЕ ====
 async function handleAddLinkText(msg) {
   if (!awaitingLinkForAdd.has(msg.from.id)) return false;
   awaitingLinkForAdd.delete(msg.from.id);
-
   const ids = extractWbIds(msg.text);
   if (!ids.length) { await sendMessage(msg.chat.id, '❌ Не нашёл артикул в ссылке', mainAdminKeyboard()); return true; }
-
   await sendMessage(msg.chat.id, `⏳ Добавляю ${ids.length} товаров…`);
   let added = 0, failed = 0;
   const lines = [];
@@ -853,7 +847,6 @@ async function handleAddLinkText(msg) {
     mainAdminKeyboard());
   return true;
 }
-
 async function handleProductAction(msg) {
   if (!awaitingProductAction.has(msg.from.id)) return false;
   const action = awaitingProductAction.get(msg.from.id);
@@ -870,7 +863,6 @@ async function handleProductAction(msg) {
   await sendMessage(msg.chat.id, `✅ Готово: <b>${exists.rows[0].name}</b>`, mainAdminKeyboard());
   return true;
 }
-
 async function handlePromoCustom(msg) {
   if (!awaitingPromoCustom.has(msg.from.id)) return false;
   const state = awaitingPromoCustom.get(msg.from.id);
@@ -923,8 +915,6 @@ app.post('/api/webhook/telegram', async (req, res) => {
   }
   if (update.message?.text) {
     const text = update.message.text.trim();
-
-    // Text handlers по приоритету
     if (await handleBroadcastText(update.message).catch(() => false)) return res.sendStatus(200);
     if (await handleUserSearch(update.message).catch(() => false)) return res.sendStatus(200);
     if (await handleAddCustomText(update.message).catch(() => false)) return res.sendStatus(200);
@@ -933,7 +923,6 @@ app.post('/api/webhook/telegram', async (req, res) => {
     if (await handleProductAction(update.message).catch(() => false)) return res.sendStatus(200);
     if (await handlePromoCustom(update.message).catch(() => false)) return res.sendStatus(200);
 
-    // Команды
     if (text === '/admin' || text === '/start' || text === '/menu') {
       await handleStart(update.message);
       return res.sendStatus(200);
@@ -941,19 +930,10 @@ app.post('/api/webhook/telegram', async (req, res) => {
     if (text === '/privacy') {
       await sendMessage(update.message.chat.id,
         `📄 <b>Политика конфиденциальности Style Room</b>\n\n` +
-        `<b>Что собираем:</b>\n` +
-        `• Telegram ID, имя, @username\n` +
-        `• Аватарку из Telegram\n` +
-        `• Фото для примерки (не сохраняются у нас)\n` +
-        `• Ссылки на товары WB\n\n` +
-        `<b>Для чего:</b>\n` +
-        `• Работа бота, генерация примерок\n` +
-        `• Учёт баланса и истории\n\n` +
-        `<b>Кому передаём:</b>\n` +
-        `• Только fal.ai — для генерации фото\n` +
-        `• Никому больше. Не продаём, не показываем рекламу.\n\n` +
-        `<b>Удаление данных:</b>\n` +
-        `Напиши администратору — удалим в течение 30 дней.`
+        `<b>Что собираем:</b>\n• Telegram ID, имя, @username\n• Аватарку из Telegram\n• Фото для примерки (не сохраняются)\n• Ссылки на товары WB\n\n` +
+        `<b>Для чего:</b>\n• Работа бота, генерация примерок\n• Учёт баланса и истории\n\n` +
+        `<b>Кому передаём:</b>\n• Только fal.ai — для генерации фото\n• Никому больше\n\n` +
+        `<b>Удаление данных:</b>\nНапиши администратору — удалим в течение 30 дней.`
       );
       return res.sendStatus(200);
     }
