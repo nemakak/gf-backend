@@ -2,15 +2,7 @@ import 'dotenv/config';
 import fetch from 'node-fetch';
 import { pool } from './db.js';
 
-// Рабочие endpoint'ы WB
-const WB_ENDPOINTS = [
-  'https://search.wb.ru/exactmatch/ru/common/v4/search',
-  'https://search.wb.ru/exactmatch/ru/common/v5/search',
-  'https://u-search.wb.ru/exactmatch/ru/common/v4/search',
-];
-
 const TOP_N = 30;
-
 const QUERIES = [
   { q: 'женская одежда',  cat: 'top' },
   { q: 'женские платья',  cat: 'dress' },
@@ -22,6 +14,13 @@ const QUERIES = [
   { q: 'женские свитеры', cat: 'top' },
   { q: 'женские топы',    cat: 'top' },
   { q: 'женские юбки',    cat: 'dress' },
+];
+
+// Разные endpoints, кто-то да сработает
+const SEARCH_ENDPOINTS = [
+  'https://search.wb.ru/exactmatch/ru/common/v5/search',
+  'https://search.wb.ru/exactmatch/ru/common/v4/search',
+  'https://u-search.wb.ru/exactmatch/ru/common/v4/search',
 ];
 
 function basketFor(id) {
@@ -48,39 +47,58 @@ function categorize(name = '') {
   return 'top';
 }
 
-async function fetchWB(query, max = TOP_N) {
+function headers() {
+  // Ротация User-Agent
+  const uas = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+  ];
+  return {
+    'User-Agent': uas[Math.floor(Math.random() * uas.length)],
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
+    'Origin': 'https://www.wildberries.ru',
+    'Referer': 'https://www.wildberries.ru/',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'cross-site',
+  };
+}
+
+async function trySearchEndpoint(baseUrl, query, max = TOP_N) {
   const params = new URLSearchParams({
     appType: '1', curr: 'rub', dest: '-1257786',
     query, resultset: 'catalog', sort: 'popular', spp: '30',
     suppressSpellcheck: 'false',
   });
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'ru-RU,ru;q=0.9',
-    'Origin': 'https://www.wildberries.ru',
-    'Referer': 'https://www.wildberries.ru/',
-  };
-
-  let lastErr = 'unknown';
-  for (const base of WB_ENDPOINTS) {
-    try {
-      const res = await fetch(`${base}?${params.toString()}`, { headers, timeout: 10000 });
-      if (!res.ok) { lastErr = `HTTP ${res.status}`; continue; }
-      const data = await res.json();
-      const products = data?.data?.products || [];
-      if (products.length) return products.slice(0, max);
-      lastErr = 'пустой ответ';
-    } catch (e) { lastErr = e.message; }
+  const res = await fetch(`${baseUrl}?${params}`, { headers: headers(), timeout: 12000 });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status}${txt ? ': ' + txt.slice(0, 80) : ''}`);
   }
-  throw new Error(lastErr);
+  const data = await res.json();
+  const products = data?.data?.products || [];
+  if (!products.length) throw new Error('пустой ответ');
+  return products.slice(0, max);
+}
+
+async function fetchWB(query, max = TOP_N) {
+  const errors = [];
+  for (const base of SEARCH_ENDPOINTS) {
+    try {
+      return await trySearchEndpoint(base, query, max);
+    } catch (e) {
+      errors.push(`${new URL(base).hostname}: ${e.message}`);
+    }
+  }
+  throw new Error(errors.join(' | '));
 }
 
 export async function refreshCatalog() {
   const t0 = Date.now();
   console.log('[wb] старт…');
-  let totalAdded = 0, totalUpdated = 0, totalFailed = 0, totalSkipped = 0;
-  let successQueries = 0;
+  let totalAdded = 0, totalUpdated = 0, totalFailed = 0, successQueries = 0;
   const errors = [];
 
   for (const { q, cat } of QUERIES) {
@@ -103,7 +121,6 @@ export async function refreshCatalog() {
         const category = categorize(name) || cat;
         const img = imageUrl(id);
         const fb = fallbackUrl(id);
-
         const existing = await pool.query('SELECT id FROM products WHERE wb_id = $1', [id]);
         if (existing.rows.length) {
           await pool.query(
@@ -121,18 +138,16 @@ export async function refreshCatalog() {
       } catch { totalFailed++; }
       await new Promise(r => setTimeout(r, 40));
     }
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 400));
   }
 
   const took = Date.now() - t0;
-  console.log(`[wb] готово ${took}ms. +${totalAdded} ~${totalUpdated} ❌${totalFailed} (запросов ок: ${successQueries}/${QUERIES.length})`);
+  console.log(`[wb] ${took}ms. +${totalAdded} ~${totalUpdated} (ok: ${successQueries}/${QUERIES.length})`);
 
-  // Если НИ ОДИН запрос не сработал — это явная ошибка
   if (successQueries === 0) {
     return {
-      added: 0, updated: 0, failed: 0,
-      success: false,
-      reason: 'WB не отдал ни один результат. Возможно, изменился API или бан по IP.',
+      added: 0, updated: 0, failed: 0, success: false,
+      reason: 'Все endpoint\'ы WB вернули ошибку (403 / пустой ответ). Скорее всего бан по IP с сервера Render.',
       errors,
     };
   }
