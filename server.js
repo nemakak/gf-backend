@@ -24,7 +24,7 @@ const SUBSCRIPTIONS = {
 };
 
 // ============================================================
-// ЛОГ ОШИБОК
+// ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ
 // ============================================================
 (async () => {
   try {
@@ -37,8 +37,16 @@ const SUBSCRIPTIONS = {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
-    console.log('[init] error_log готова');
-  } catch (e) { console.error('[error_log] init:', e.message); }
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      );
+    `);
+    await pool.query(`INSERT INTO app_settings (key, value) VALUES ('maintenance', 'false') ON CONFLICT (key) DO NOTHING;`);
+    await pool.query(`INSERT INTO app_settings (key, value) VALUES ('maintenance_text', 'Ведутся технические работы. Заходите чуть позже ✨') ON CONFLICT (key) DO NOTHING;`);
+    console.log('[init] таблицы готовы');
+  } catch (e) { console.error('[init]', e.message); }
 })();
 
 async function logError(source, message, detail = null) {
@@ -83,6 +91,23 @@ const answerCallback = (id, text = '') => tgApi('answerCallbackQuery', { callbac
 async function isAdmin(tgId) {
   try { const r = await pool.query('SELECT is_admin FROM users WHERE tg_id = $1', [tgId]); return r.rows[0]?.is_admin === true; }
   catch { return false; }
+}
+
+async function getSetting(key, defaultValue = null) {
+  try {
+    const r = await pool.query('SELECT value FROM app_settings WHERE key = $1', [key]);
+    return r.rows[0]?.value ?? defaultValue;
+  } catch { return defaultValue; }
+}
+async function setSetting(key, value) {
+  await pool.query(
+    `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [key, String(value)]
+  );
+}
+async function isMaintenanceMode() {
+  return (await getSetting('maintenance', 'false')) === 'true';
 }
 
 function basketFor(id) {
@@ -156,6 +181,19 @@ function guessCategory(name) {
 }
 
 // ============================================================
+// PUBLIC: SETTINGS (техобслуживание)
+// ============================================================
+app.get('/api/settings', async (_req, res) => {
+  try {
+    const maintenance = await isMaintenanceMode();
+    const text = await getSetting('maintenance_text', 'Ведутся технические работы');
+    res.json({ success: true, maintenance, maintenance_text: text });
+  } catch {
+    res.json({ success: true, maintenance: false, maintenance_text: '' });
+  }
+});
+
+// ============================================================
 // AUTH
 // ============================================================
 app.post('/api/auth', async (req, res) => {
@@ -217,7 +255,7 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// FAL
+// FAL helpers
 // ============================================================
 async function withTimeout(promise, ms, label) {
   return Promise.race([
@@ -285,7 +323,7 @@ async function runFalTryon({ humanImg, garmentUrl }) {
 
   const t0 = Date.now();
 
-  // ШАГ 1: дешёвая image-apps-v2 ($0.04), таймаут 15 сек
+  // ШАГ 1: дешёвая image-apps-v2
   console.log('[tryon] шаг 1: image-apps-v2 (15s, $0.04)');
   try {
     const url = await withTimeout(
@@ -301,7 +339,7 @@ async function runFalTryon({ humanImg, garmentUrl }) {
     }
   } catch (e) { logFalError('image-apps-v2', e); }
 
-  // ШАГ 2: дорогая fashn-v1.6 ($0.075), таймаут 20 сек
+  // ШАГ 2: дорогая fashn-v1.6
   console.log('[tryon] шаг 2: fashn-v1.6 (20s, $0.075, резерв)');
   try {
     const url = await withTimeout(
@@ -322,7 +360,7 @@ async function runFalTryon({ humanImg, garmentUrl }) {
 }
 
 // ============================================================
-// TRYON ENDPOINT
+// TRYON endpoints
 // ============================================================
 app.post('/api/tryon', async (req, res) => {
   const t0 = Date.now();
@@ -523,7 +561,7 @@ app.post('/api/create-invoice', async (req, res) => {
 });
 
 // ============================================================
-// ПРОВЕРКА БИТЫХ ТОВАРОВ (параллельно по 10)
+// ПРОВЕРКА БИТЫХ ТОВАРОВ
 // ============================================================
 async function checkBrokenProducts() {
   const t0 = Date.now();
@@ -581,6 +619,7 @@ function mainAdminKeyboard() {
       [{ text: '🛍 Каталог', callback_data: 'adm_catalog' }],
       [{ text: '📢 Рассылка', callback_data: 'adm_broadcast' }],
       [{ text: '🔔 Ошибки', callback_data: 'adm_errors' }],
+      [{ text: '🚧 Техобслуживание', callback_data: 'adm_maintenance' }],
       [{ text: '❓ Помощь', callback_data: 'adm_help' }],
     ],
   };
@@ -641,6 +680,18 @@ function userActionsKeyboard(tgId) {
     ],
   };
 }
+function maintenanceKeyboard(isOn) {
+  return {
+    inline_keyboard: [
+      [{
+        text: isOn ? '✅ Включить приложение' : '🚧 Включить техобслуживание',
+        callback_data: isOn ? 'adm_maint_off' : 'adm_maint_on',
+      }],
+      [{ text: '✏️ Изменить текст', callback_data: 'adm_maint_text' }],
+      [{ text: '← Назад', callback_data: 'adm_back' }],
+    ],
+  };
+}
 
 const awaitingBroadcast = new Set();
 const awaitingBroadcastPhoto = new Map();
@@ -650,6 +701,7 @@ const awaitingLinkForAdd = new Set();
 const awaitingPromoCustom = new Map();
 const awaitingProductAction = new Map();
 const awaitingDM = new Map();
+const awaitingMaintText = new Set();
 
 function randomCode(len = 6) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -681,6 +733,35 @@ async function handleCallback(cb) {
 
   if (data === 'adm_back') return back();
   if (data === 'adm_help') return editMessage(chatId, messageId, '❓ Всё делается по кнопкам.', backKb);
+
+  // === ТЕХОБСЛУЖИВАНИЕ ===
+  if (data === 'adm_maintenance') {
+    const on = await isMaintenanceMode();
+    const text = await getSetting('maintenance_text', '');
+    return editMessage(chatId, messageId,
+      `🚧 <b>Режим техобслуживания</b>\n\n` +
+      `Статус: ${on ? '🔴 <b>ВКЛЮЧЕНО</b> — юзеры видят заглушку' : '🟢 <b>ВЫКЛЮЧЕНО</b> — приложение работает'}\n\n` +
+      `Текст для юзеров:\n<i>${text}</i>`,
+      maintenanceKeyboard(on));
+  }
+  if (data === 'adm_maint_on') {
+    await setSetting('maintenance', 'true');
+    return editMessage(chatId, messageId,
+      `🚧 <b>Техобслуживание ВКЛЮЧЕНО</b>\n\nЮзеры видят заглушку вместо приложения.`,
+      maintenanceKeyboard(true));
+  }
+  if (data === 'adm_maint_off') {
+    await setSetting('maintenance', 'false');
+    return editMessage(chatId, messageId,
+      `✅ <b>Приложение снова работает</b>`,
+      maintenanceKeyboard(false));
+  }
+  if (data === 'adm_maint_text') {
+    awaitingMaintText.add(userId);
+    return editMessage(chatId, messageId,
+      `✏️ Пришли новый текст для юзеров.\n\nТекущий:\n<i>${await getSetting('maintenance_text', '')}</i>`,
+      { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_maintenance' }]] });
+  }
 
   if (data === 'adm_stats') {
     try {
@@ -960,6 +1041,17 @@ async function showUserCard(chatId, messageId, tgId, toast = null) {
 // ============================================================
 // TEXT/PHOTO HANDLERS
 // ============================================================
+async function handleMaintText(msg) {
+  if (!awaitingMaintText.has(msg.from.id)) return false;
+  awaitingMaintText.delete(msg.from.id);
+  const text = msg.text.trim().slice(0, 500);
+  if (!text) { await sendMessage(msg.chat.id, '❌ Пусто'); return true; }
+  await setSetting('maintenance_text', text);
+  const on = await isMaintenanceMode();
+  await sendMessage(msg.chat.id, `✅ Текст обновлён:\n\n<i>${text}</i>`, maintenanceKeyboard(on));
+  return true;
+}
+
 async function handleBroadcastText(msg) {
   if (awaitingBroadcast.has(msg.from.id)) {
     awaitingBroadcast.delete(msg.from.id);
@@ -1144,6 +1236,7 @@ app.post('/api/webhook/telegram', async (req, res) => {
   }
   if (update.message?.text) {
     const text = update.message.text.trim();
+    if (await handleMaintText(update.message).catch(() => false)) return res.sendStatus(200);
     if (await handleBroadcastText(update.message).catch(() => false)) return res.sendStatus(200);
     if (await handleUserSearch(update.message).catch(() => false)) return res.sendStatus(200);
     if (await handleAddCustomText(update.message).catch(() => false)) return res.sendStatus(200);
