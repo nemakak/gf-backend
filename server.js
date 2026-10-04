@@ -174,7 +174,7 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// FAL с таймаутом и подробным логированием
+// FAL helpers
 // ============================================================
 async function withTimeout(promise, ms, label) {
   return Promise.race([
@@ -192,6 +192,30 @@ function logFalError(label, e) {
       cause: e.cause?.message || null,
     }));
   } catch { console.warn('[tryon] DETAIL: (не удалось сериализовать)'); }
+}
+
+// Скачиваем картинку с WB (с нужными заголовками) и превращаем в base64
+async function fetchImageAsBase64(url) {
+  try {
+    const r = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Referer': 'https://www.wildberries.ru/',
+        'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+      },
+    });
+    if (!r.ok) {
+      console.warn(`[img] fetch ${url.slice(0, 80)} → HTTP ${r.status}`);
+      return null;
+    }
+    const buf = await r.buffer();
+    const contentType = r.headers.get('content-type') || 'image/jpeg';
+    console.log(`[img] ${url.slice(0, 60)} → ${buf.length}b (${contentType})`);
+    return `data:${contentType};base64,${buf.toString('base64')}`;
+  } catch (e) {
+    console.warn(`[img] ошибка скачивания: ${e.message}`);
+    return null;
+  }
 }
 
 async function tryFashnV16(h, g) {
@@ -224,10 +248,18 @@ async function tryImageApps(h, g) {
 }
 
 async function runFalTryon({ humanImg, garmentUrl }) {
+  // Скачиваем картинку WB и превращаем в base64
+  let garmentData = garmentUrl;
+  if (garmentUrl && garmentUrl.startsWith('http') && !garmentUrl.startsWith('data:')) {
+    const b64 = await fetchImageAsBase64(garmentUrl);
+    if (b64) garmentData = b64;
+    else console.warn('[tryon] не удалось скачать garment:', garmentUrl.slice(0, 80));
+  }
+
   const attempts = [
-    { name: 'fashn-v1.6',    fn: () => tryFashnV16(humanImg, garmentUrl) },
-    { name: 'fashn-v1.5',    fn: () => tryFashnV15(humanImg, garmentUrl) },
-    { name: 'image-apps-v2', fn: () => tryImageApps(humanImg, garmentUrl) },
+    { name: 'fashn-v1.6',    fn: () => tryFashnV16(humanImg, garmentData) },
+    { name: 'fashn-v1.5',    fn: () => tryFashnV15(humanImg, garmentData) },
+    { name: 'image-apps-v2', fn: () => tryImageApps(humanImg, garmentData) },
   ];
   for (const a of attempts) {
     try {
@@ -572,12 +604,11 @@ async function handleCallback(cb) {
       `<b>👥 Пользователи</b> — список, карточка юзера.\n\n` +
       `<b>🎁 Выдать попытки</b> — по @username или ID.\n\n` +
       `<b>🎟 Промокоды</b> — быстрые и свои.\n\n` +
-      `<b>🛍 Каталог</b> — товар добавляется по одной ссылке WB, всё подтягивается автоматически.\n\n` +
+      `<b>🛍 Каталог</b> — товар добавляется по одной ссылке WB.\n\n` +
       `<b>📢 Рассылка</b> — всем юзерам.`,
       backKb);
   }
 
-  // ===== СТАТИСТИКА =====
   if (data === 'adm_stats') {
     const u = await pool.query('SELECT COUNT(*)::int AS c, COALESCE(SUM(balance),0)::int AS b FROM users');
     const t = await pool.query('SELECT COUNT(*)::int AS c FROM tryon_history');
@@ -593,7 +624,6 @@ async function handleCallback(cb) {
       backKb);
   }
 
-  // ===== ВЫДАТЬ ПОПЫТКИ =====
   if (data === 'adm_give_tries') {
     awaitingUserSearch.add(userId);
     return editMessage(chatId, messageId,
@@ -601,7 +631,6 @@ async function handleCallback(cb) {
       { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_back' }]] });
   }
 
-  // ===== ПОЛЬЗОВАТЕЛИ =====
   if (data === 'adm_users') return editMessage(chatId, messageId, '👥 <b>Пользователи</b>', usersMenuKeyboard());
   if (data === 'adm_users_last') {
     const r = await pool.query(`SELECT tg_id, first_name, balance FROM users ORDER BY created_at DESC LIMIT 20`);
@@ -678,12 +707,11 @@ async function handleCallback(cb) {
     return editMessage(chatId, messageId, '🗑 Юзер удалён.', { inline_keyboard: [[{ text: '← К юзерам', callback_data: 'adm_users' }]] });
   }
 
-  // ===== КАТАЛОГ =====
   if (data === 'adm_catalog') return editMessage(chatId, messageId, '🛍 <b>Каталог</b>', catalogMenuKeyboard());
   if (data === 'adm_add_link') {
     awaitingLinkForAdd.add(userId);
     return editMessage(chatId, messageId,
-      `➕ <b>Добавить товар</b>\n\nПришли <b>ссылку WB</b> (можно несколько, по одной на строку).\n\nНазвание, цена и картинка подтянутся автоматически.`,
+      `➕ <b>Добавить товар</b>\n\nПришли <b>ссылку WB</b> (можно несколько, по одной на строку).`,
       { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_catalog' }]] });
   }
   if (['adm_pin', 'adm_hide', 'adm_unhide', 'adm_delete'].includes(data)) {
@@ -721,7 +749,6 @@ async function handleCallback(cb) {
     } catch (e) { return editMessage(chatId, messageId, '❌ ' + e.message, backKb); }
   }
 
-  // ===== ПРОМОКОДЫ =====
   if (data === 'adm_promo') return editMessage(chatId, messageId, '🎟 <b>Промокоды</b>', promoMenuKeyboard());
   if (data === 'adm_promo_custom') {
     awaitingPromoCustom.set(userId, { step: 'code' });
@@ -754,7 +781,6 @@ async function handleCallback(cb) {
     return editMessage(chatId, messageId, `✅ Деактивирован`, { inline_keyboard: [[{ text: '←', callback_data: 'adm_promo' }]] });
   }
 
-  // ===== РАССЫЛКА =====
   if (data === 'adm_broadcast') {
     awaitingBroadcast.add(userId);
     return editMessage(chatId, messageId, '📢 Напиши текст рассылки:', { inline_keyboard: [[{ text: '❌', callback_data: 'adm_back' }]] });
