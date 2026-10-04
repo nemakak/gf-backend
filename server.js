@@ -523,25 +523,58 @@ async function checkBrokenProducts() {
   console.log('[cleanup] старт…');
   try {
     const r = await pool.query(`SELECT id, wb_id, name FROM products WHERE is_active = TRUE`);
+    const rows = r.rows;
+    console.log(`[cleanup] товаров для проверки: ${rows.length}`);
+
     let checked = 0, broken = 0;
     const brokenList = [];
-    for (const row of r.rows) {
-      checked++;
-      try {
-        const imgUrl = primaryImageUrl(row.wb_id);
-        const res = await fetch(imgUrl, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' } });
-        if (!res.ok) {
-          const altUrl = fallbackImageUrl(row.wb_id);
-          const res2 = await fetch(altUrl, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' } });
-          if (!res2.ok) {
-            await pool.query(`UPDATE products SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [row.id]);
-            broken++;
-            brokenList.push(`${row.wb_id} — ${(row.name || '').slice(0, 40)}`);
+
+    // Параллельно по 10 штук
+    const CONCURRENCY = 10;
+    for (let i = 0; i < rows.length; i += CONCURRENCY) {
+      const chunk = rows.slice(i, i + CONCURRENCY);
+      await Promise.all(chunk.map(async (row) => {
+        checked++;
+        try {
+          const imgUrl = primaryImageUrl(row.wb_id);
+          let res = await fetch(imgUrl, {
+            method: 'HEAD',
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' },
+            timeout: 5000,
+          });
+          if (!res.ok) {
+            const altUrl = fallbackImageUrl(row.wb_id);
+            res = await fetch(altUrl, {
+              method: 'HEAD',
+              headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' },
+              timeout: 5000,
+            });
+            if (!res.ok) {
+              await pool.query(`UPDATE products SET is_active = FALSE, updated_at = NOW() WHERE id = $1`, [row.id]);
+              broken++;
+              brokenList.push(`${row.wb_id} — ${(row.name || '').slice(0, 40)}`);
+            }
           }
+        } catch (e) {
+          console.warn(`[cleanup] ${row.wb_id}: ${e.message}`);
         }
-        await new Promise(rs => setTimeout(rs, 150));
-      } catch {}
+      }));
     }
+
+    console.log(`[cleanup] готово ${Date.now() - t0}ms. Проверено: ${checked}, скрыто: ${broken}`);
+    if (broken > 0) {
+      await logError('cleanup', `Скрыто битых: ${broken}`, brokenList.slice(0, 30).join('\n'));
+      const admins = await pool.query('SELECT tg_id FROM users WHERE is_admin = TRUE');
+      const msg = `🧹 <b>Автопроверка</b>\n\nПроверено: <b>${checked}</b>\nСкрыто: <b>${broken}</b>\n\n` +
+        brokenList.slice(0, 20).map(t => `• <code>${t}</code>`).join('\n');
+      for (const a of admins.rows) sendMessage(a.tg_id, msg).catch(() => {});
+    } else {
+      // Тоже уведомим что всё ок
+      const admins = await pool.query('SELECT tg_id FROM users WHERE is_admin = TRUE');
+      for (const a of admins.rows) sendMessage(a.tg_id, `🧹 Проверено: <b>${checked}</b>, битых: <b>0</b> ✅`).catch(() => {});
+    }
+  } catch (e) { logError('cleanup', e.message); }
+}
     console.log(`[cleanup] готово ${Date.now() - t0}ms. Проверено: ${checked}, скрыто: ${broken}`);
     if (broken > 0) {
       await logError('cleanup', `Скрыто битых: ${broken}`, brokenList.slice(0, 30).join('\n'));
