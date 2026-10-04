@@ -234,7 +234,6 @@ function logFalError(label, e) {
   } catch {}
 }
 
-// Скачиваем картинку WB → отдаём в base64 (без сжатия — FAL принимает как есть)
 async function fetchImageAsBase64(url) {
   try {
     const r = await fetch(url, {
@@ -516,7 +515,7 @@ app.post('/api/create-invoice', async (req, res) => {
 });
 
 // ============================================================
-// ПРОВЕРКА БИТЫХ
+// ПРОВЕРКА БИТЫХ ТОВАРОВ (параллельно по 10)
 // ============================================================
 async function checkBrokenProducts() {
   const t0 = Date.now();
@@ -529,7 +528,6 @@ async function checkBrokenProducts() {
     let checked = 0, broken = 0;
     const brokenList = [];
 
-    // Параллельно по 10 штук
     const CONCURRENCY = 10;
     for (let i = 0; i < rows.length; i += CONCURRENCY) {
       const chunk = rows.slice(i, i + CONCURRENCY);
@@ -562,25 +560,15 @@ async function checkBrokenProducts() {
     }
 
     console.log(`[cleanup] готово ${Date.now() - t0}ms. Проверено: ${checked}, скрыто: ${broken}`);
+
+    const admins = await pool.query('SELECT tg_id FROM users WHERE is_admin = TRUE');
     if (broken > 0) {
       await logError('cleanup', `Скрыто битых: ${broken}`, brokenList.slice(0, 30).join('\n'));
-      const admins = await pool.query('SELECT tg_id FROM users WHERE is_admin = TRUE');
       const msg = `🧹 <b>Автопроверка</b>\n\nПроверено: <b>${checked}</b>\nСкрыто: <b>${broken}</b>\n\n` +
         brokenList.slice(0, 20).map(t => `• <code>${t}</code>`).join('\n');
       for (const a of admins.rows) sendMessage(a.tg_id, msg).catch(() => {});
     } else {
-      // Тоже уведомим что всё ок
-      const admins = await pool.query('SELECT tg_id FROM users WHERE is_admin = TRUE');
-      for (const a of admins.rows) sendMessage(a.tg_id, `🧹 Проверено: <b>${checked}</b>, битых: <b>0</b> ✅`).catch(() => {});
-    }
-  } catch (e) { logError('cleanup', e.message); }
-}
-    console.log(`[cleanup] готово ${Date.now() - t0}ms. Проверено: ${checked}, скрыто: ${broken}`);
-    if (broken > 0) {
-      await logError('cleanup', `Скрыто битых: ${broken}`, brokenList.slice(0, 30).join('\n'));
-      const admins = await pool.query('SELECT tg_id FROM users WHERE is_admin = TRUE');
-      const msg = `🧹 <b>Автопроверка</b>\n\nПроверено: <b>${checked}</b>\nСкрыто: <b>${broken}</b>\n\n` +
-        brokenList.slice(0, 20).map(t => `• <code>${t}</code>`).join('\n');
+      const msg = `🧹 Проверено: <b>${checked}</b>, битых: <b>0</b> ✅`;
       for (const a of admins.rows) sendMessage(a.tg_id, msg).catch(() => {});
     }
   } catch (e) { logError('cleanup', e.message); }
@@ -833,34 +821,51 @@ async function handleCallback(cb) {
     awaitingLinkForAdd.add(userId);
     return editMessage(chatId, messageId, `➕ Пришли <b>ссылку WB</b>:`, { inline_keyboard: [[{ text: '❌', callback_data: 'adm_catalog' }]] });
   }
+
+  // === ПРОВЕРКА В ФОНЕ ===
   if (data === 'adm_check_products') {
-    await editMessage(chatId, messageId, '🧹 Проверяю… Это займёт пару минут.', backKb);
-    checkBrokenProducts().then(() => {
-      sendMessage(chatId, '✅ Проверка завершена. Результат выше.', mainAdminKeyboard()).catch(() => {});
-    }).catch(e => sendMessage(chatId, '❌ ' + e.message, mainAdminKeyboard()));
+    editMessage(chatId, messageId, '🧹 Проверка запущена в фоне.\n\nРезультат придёт уведомлением.', backKb).catch(() => {});
+    setImmediate(() => {
+      checkBrokenProducts().catch(e => logError('cleanup-bg', e.message));
+    });
     return;
   }
+
+  // === УДАЛЕНИЕ В ФОНЕ ===
   if (data === 'adm_delete_broken') {
-    await editMessage(chatId, messageId, '🗑 Удаляю нерабочие…', backKb);
-    try {
-      const r = await pool.query(`SELECT id, wb_id FROM products WHERE is_active = TRUE`);
-      let deleted = 0;
-      for (const row of r.rows) {
-        try {
-          const imgUrl = primaryImageUrl(row.wb_id);
-          const res = await fetch(imgUrl, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' } });
-          if (!res.ok) {
-            const altUrl = fallbackImageUrl(row.wb_id);
-            const res2 = await fetch(altUrl, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' } });
-            if (!res2.ok) { await pool.query('DELETE FROM products WHERE id = $1', [row.id]); deleted++; }
-          }
-          await new Promise(rs => setTimeout(rs, 150));
-        } catch {}
-      }
-      await sendMessage(chatId, `🗑 Удалено: <b>${deleted}</b>`, mainAdminKeyboard());
-    } catch (e) { await sendMessage(chatId, '❌ ' + e.message, mainAdminKeyboard()); }
+    editMessage(chatId, messageId, '🗑 Удаляю нерабочие в фоне.\n\nРезультат придёт уведомлением.', backKb).catch(() => {});
+    setImmediate(async () => {
+      try {
+        const r = await pool.query(`SELECT id, wb_id, name FROM products WHERE is_active = TRUE`);
+        let deleted = 0;
+        const deletedList = [];
+        const CONCURRENCY = 10;
+        for (let i = 0; i < r.rows.length; i += CONCURRENCY) {
+          const chunk = r.rows.slice(i, i + CONCURRENCY);
+          await Promise.all(chunk.map(async (row) => {
+            try {
+              const imgUrl = primaryImageUrl(row.wb_id);
+              let res = await fetch(imgUrl, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' }, timeout: 5000 });
+              if (!res.ok) {
+                const altUrl = fallbackImageUrl(row.wb_id);
+                res = await fetch(altUrl, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.wildberries.ru/' }, timeout: 5000 });
+                if (!res.ok) {
+                  await pool.query('DELETE FROM products WHERE id = $1', [row.id]);
+                  deleted++;
+                  deletedList.push(`${row.wb_id} — ${(row.name || '').slice(0, 30)}`);
+                }
+              }
+            } catch {}
+          }));
+        }
+        const admins = await pool.query('SELECT tg_id FROM users WHERE is_admin = TRUE');
+        const msg = `🗑 <b>Удалено нерабочих: ${deleted}</b>\n\n` + deletedList.slice(0, 20).map(t => `• <code>${t}</code>`).join('\n');
+        for (const a of admins.rows) sendMessage(a.tg_id, msg).catch(() => {});
+      } catch (e) { logError('delete-broken', e.message); }
+    });
     return;
   }
+
   if (['adm_pin', 'adm_hide', 'adm_unhide', 'adm_delete'].includes(data)) {
     const action = data.replace('adm_', '');
     awaitingProductAction.set(userId, action);
@@ -871,7 +876,7 @@ async function handleCallback(cb) {
     await editMessage(chatId, messageId, '🔄 Обновляю…', backKb);
     try {
       const r = await pool.query(`SELECT id, wb_id FROM products WHERE name LIKE 'Товар WB%' OR name IS NULL OR TRIM(name) = '' ORDER BY id DESC LIMIT 300`);
-      console.log(`[backfill] найдено товаров для обновления: ${r.rows.length}`);
+      console.log(`[backfill] товаров для обновления: ${r.rows.length}`);
       if (!r.rows.length) {
         await sendMessage(chatId, `ℹ️ Нет товаров с заглушками — все названия уже нормальные.`, backKb);
         return;
