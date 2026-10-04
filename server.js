@@ -113,20 +113,16 @@ function fallbackImageUrl(id) {
   return `https://basket-${basketFor(id)}.wbbasket.ru/vol${vol}/part${part}/${id}/images/big/1.webp`;
 }
 
-// Извлечение артикулов WB из текста
 function extractWbIds(text) {
   const ids = new Set();
-  // 1. Ссылки вида /catalog/12345678/detail.aspx
   const re1 = /\/catalog\/(\d{6,})/g;
   let m;
   while ((m = re1.exec(text)) !== null) ids.add(Number(m[1]));
-  // 2. Голые артикулы (6+ цифр подряд)
   const re2 = /\b(\d{6,})\b/g;
   while ((m = re2.exec(text)) !== null) ids.add(Number(m[1]));
   return Array.from(ids);
 }
 
-// Получение инфы о товаре с WB через прокси
 async function fetchWBProductInfo(wbId) {
   const url = 'https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm=' + wbId;
   try {
@@ -269,11 +265,11 @@ app.get('/api/catalog', async (req, res) => {
 
     const q = `
       WITH ranked AS (
-        SELECT id, wb_id, name, price, category, image_url, fallback_url, is_pinned,
+        SELECT id, wb_id, name, price, category, image_url, fallback_url, description, is_pinned,
           ROW_NUMBER() OVER (PARTITION BY category ORDER BY updated_at DESC, id DESC) AS rn
         FROM products ${where}
       )
-      SELECT id, wb_id, name, price, category, image_url, fallback_url
+      SELECT id, wb_id, name, price, category, image_url, fallback_url, description
       FROM ranked
       ORDER BY is_pinned DESC NULLS LAST, rn ASC, MD5(category || id::text) ASC
       LIMIT $${params.length - 1} OFFSET $${params.length}`;
@@ -477,10 +473,9 @@ app.post('/api/cleanup', async (req, res) => {
 });
 
 // ============================================================
-// 11. АДМИН-ПАНЕЛЬ — ПОЛНАЯ ПЕРЕРАБОТКА
+// 11. АДМИН-ПАНЕЛЬ
 // ============================================================
 
-// Главное меню админки
 function mainAdminKeyboard() {
   return {
     inline_keyboard: [
@@ -489,7 +484,8 @@ function mainAdminKeyboard() {
       [{ text: '🔍 Поиск юзера', callback_data: 'adm_find' }],
       [{ text: '🎁 Промокоды', callback_data: 'adm_promo_menu' }],
       [{ text: '📌 Каталог: модерация', callback_data: 'adm_moderate' }],
-      [{ text: '➕ Добавить товары по ссылкам', callback_data: 'adm_add_links' }],
+      [{ text: '➕ Добавить по ссылкам', callback_data: 'adm_add_links' }],
+      [{ text: '✏️ Добавить вручную', callback_data: 'adm_add_manual' }],
       [{ text: '🧹 Очистить старые', callback_data: 'adm_cleanup' }],
       [{ text: '📢 Рассылка всем', callback_data: 'adm_broadcast' }],
       [{ text: '❓ Помощь', callback_data: 'adm_help' }],
@@ -497,7 +493,6 @@ function mainAdminKeyboard() {
   };
 }
 
-// Меню «Пользователи»
 function usersMenuKeyboard() {
   return {
     inline_keyboard: [
@@ -510,7 +505,6 @@ function usersMenuKeyboard() {
   };
 }
 
-// Карточка юзера — кнопки действий
 function userActionsKeyboard(tgId) {
   return {
     inline_keyboard: [
@@ -525,7 +519,6 @@ function userActionsKeyboard(tgId) {
   };
 }
 
-// Промокоды
 function promoMenuKeyboard() {
   return {
     inline_keyboard: [
@@ -548,7 +541,6 @@ function promoTypesKeyboard() {
   };
 }
 
-// Модерация каталога
 function catalogMenuKeyboard() {
   return {
     inline_keyboard: [
@@ -556,18 +548,20 @@ function catalogMenuKeyboard() {
       [{ text: '✂️ Открепить товар', callback_data: 'adm_unpin' }],
       [{ text: '🙈 Скрыть товар', callback_data: 'adm_hide' }],
       [{ text: '👁 Вернуть товар', callback_data: 'adm_unhide' }],
-      [{ text: '➕ Добавить товары по ссылкам', callback_data: 'adm_add_links' }],
+      [{ text: '➕ Добавить по ссылкам', callback_data: 'adm_add_links' }],
+      [{ text: '✏️ Добавить вручную', callback_data: 'adm_add_manual' }],
       [{ text: '← Назад', callback_data: 'adm_back' }],
     ],
   };
 }
 
-// ==== СОСТОЯНИЯ ====
 const awaitingBroadcast = new Set();
 const awaitingModeration = new Map();
 const awaitingUserSearch = new Set();
-const awaitingAddCustom = new Map(); // userId → targetTgId (для «+Своё число»)
-const awaitingLinks = new Set();     // userId (для «Добавить по ссылкам»)
+const awaitingAddCustom = new Map();
+const awaitingLinks = new Set();
+const awaitingLinksDesc = new Map();
+const awaitingManualProduct = new Map();
 
 function randomCode(prefix = 'WELCOME') {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -581,9 +575,7 @@ async function handleStart(msg) {
   const isAdm = await isAdmin(msg.from.id);
   if (isAdm) {
     await sendMessage(chatId,
-      `👑 <b>Админ-панель Style Room</b>\n\n` +
-      `Выбери раздел из меню ниже.\n\n` +
-      `💡 Если не знаешь, что делать — нажми «❓ Помощь».`,
+      `👑 <b>Админ-панель Style Room</b>\n\nВыбери раздел из меню ниже.`,
       mainAdminKeyboard());
   } else {
     await sendMessage(chatId, '✨ Добро пожаловать в Style Room!\n\nНажми кнопку ниже, чтобы открыть приложение.');
@@ -596,7 +588,6 @@ async function handleAdminMenu(msg) {
   await sendMessage(chatId, '👑 <b>Админ-панель</b>\n\nВыбери раздел:', mainAdminKeyboard());
 }
 
-// Показать карточку юзера
 async function showUserCard(chatId, messageId, tgId, toast = null) {
   try {
     const r = await pool.query(
@@ -652,520 +643,24 @@ async function handleCallback(cb) {
   if (!(await isAdmin(userId))) return answerCallback(cb.id, '⛔ Нет доступа');
   await answerCallback(cb.id);
 
-  // ==== Назад в главное ====
   if (data === 'adm_back') {
     return editMessage(chatId, messageId, '👑 <b>Админ-панель</b>\n\nВыбери раздел:', mainAdminKeyboard());
   }
 
-  // ==== Помощь ====
   if (data === 'adm_help') {
     return editMessage(chatId, messageId,
       `❓ <b>Помощь по админке</b>\n\n` +
-      `<b>📊 Статистика</b> — сколько юзеров, примерок, товаров, платежей.\n\n` +
-      `<b>👥 Пользователи</b> — список последних юзеров. Нажми на юзера, чтобы открыть карточку. Там можно начислить примерки, обнулить баланс, дать безлимит.\n\n` +
-      `<b>🔍 Поиск юзера</b> — введи tg_id (цифры), @username или часть имени.\n\n` +
-      `<b>🎁 Промокоды</b> — создавай коды на +5/+10/+20 попыток или безлимит 24ч. Юзеры вводят их в профиле приложения.\n\n` +
-      `<b>📌 Каталог</b> — закрепить товар наверху раздела, скрыть, вернуть. Введи wb_id (число — артикул Wildberries).\n\n` +
-      `<b>➕ Добавить товары по ссылкам</b> — отправь пачку ссылок WB одним сообщением, разделяя переносами или пробелами. Бот сам достанет артикулы и добавит товары.\n\n` +
+      `<b>📊 Статистика</b> — юзеры, примерки, товары, платежи.\n\n` +
+      `<b>👥 Пользователи</b> — список последних. Нажми на юзера → карточка с действиями.\n\n` +
+      `<b>🔍 Поиск юзера</b> — tg_id, @username или часть имени.\n\n` +
+      `<b>🎁 Промокоды</b> — создавай коды на попытки/безлимит.\n\n` +
+      `<b>📌 Каталог</b> — закрепить/скрыть/вернуть товар по wb_id.\n\n` +
+      `<b>➕ Добавить по ссылкам</b> — пришли ссылки WB (или голые артикулы). Бот спросит описание, потом добавит все товары.\n\n` +
+      `<b>✏️ Добавить вручную</b> — пошаговый ввод: артикул → название → цена → категория → описание.\n\n` +
       `<b>🧹 Очистить старые</b> — удалить товары старше 5 дней.\n\n` +
-      `<b>📢 Рассылка</b> — отправить сообщение всем юзерам.\n\n` +
-      `💡 <b>Пример ссылок для добавления:</b>\n` +
-      `<code>https://www.wildberries.ru/catalog/183581368/detail.aspx</code>\n` +
-      `<code>183581368</code> (просто артикул тоже сработает)`,
+      `<b>📢 Рассылка</b> — отправить сообщение всем юзерам.`,
       { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]] });
   }
 
-  // ==== Статистика ====
   if (data === 'adm_stats') {
-    const users = await pool.query('SELECT COUNT(*)::int AS c FROM users');
-    const tryons = await pool.query('SELECT COUNT(*)::int AS c FROM tryon_history');
-    const products = await pool.query('SELECT COUNT(*)::int AS c FROM products WHERE is_active = TRUE');
-    const payments = await pool.query('SELECT COUNT(*)::int AS c, COALESCE(SUM(stars),0)::int AS s FROM payments');
-    const today = await pool.query(`SELECT COUNT(*)::int AS c FROM users WHERE created_at > NOW() - INTERVAL '1 day'`);
-    return editMessage(chatId, messageId,
-      `📊 <b>Статистика</b>\n\n` +
-      `👥 Всего юзеров: <b>${users.rows[0].c}</b>\n` +
-      `🆕 За сутки: <b>${today.rows[0].c}</b>\n` +
-      `✨ Примерок: <b>${tryons.rows[0].c}</b>\n` +
-      `👗 Товаров: <b>${products.rows[0].c}</b>\n` +
-      `💳 Платежей: <b>${payments.rows[0].c}</b> · ⭐ <b>${payments.rows[0].s}</b>`,
-      { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]] });
-  }
-
-  // ==== Меню юзеров ====
-  if (data === 'adm_users') {
-    return editMessage(chatId, messageId, '👥 <b>Пользователи</b>\n\nВыбери, что показать:', usersMenuKeyboard());
-  }
-
-  if (data === 'adm_users_last') {
-    const r = await pool.query(`SELECT tg_id, first_name, balance FROM users ORDER BY created_at DESC LIMIT 20`);
-    if (!r.rows.length) return editMessage(chatId, messageId, '👥 Юзеров пока нет.',
-      { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_users' }]] });
-    const btns = r.rows.map(u => ([{ text: `${u.first_name || '—'} · ✨${u.balance}`, callback_data: `usr_show_${u.tg_id}` }]));
-    btns.push([{ text: '← Назад', callback_data: 'adm_users' }]);
-    return editMessage(chatId, messageId, '👥 <b>Последние 20:</b>\n\nНажми на юзера:', { inline_keyboard: btns });
-  }
-
-  if (data === 'adm_users_top') {
-    const r = await pool.query(`SELECT tg_id, first_name, balance FROM users ORDER BY balance DESC LIMIT 20`);
-    const btns = r.rows.map(u => ([{ text: `${u.first_name || '—'} · ✨${u.balance}`, callback_data: `usr_show_${u.tg_id}` }]));
-    btns.push([{ text: '← Назад', callback_data: 'adm_users' }]);
-    return editMessage(chatId, messageId, '💰 <b>Топ по балансу:</b>', { inline_keyboard: btns });
-  }
-
-  if (data === 'adm_users_new') {
-    const r = await pool.query(`SELECT tg_id, first_name, balance FROM users WHERE created_at > NOW() - INTERVAL '1 day' ORDER BY created_at DESC LIMIT 20`);
-    if (!r.rows.length) return editMessage(chatId, messageId, '🆕 Новых за сутки нет.',
-      { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_users' }]] });
-    const btns = r.rows.map(u => ([{ text: `${u.first_name || '—'} · ✨${u.balance}`, callback_data: `usr_show_${u.tg_id}` }]));
-    btns.push([{ text: '← Назад', callback_data: 'adm_users' }]);
-    return editMessage(chatId, messageId, '🆕 <b>Новые за сутки:</b>', { inline_keyboard: btns });
-  }
-
-  // ==== Найти юзера ====
-  if (data === 'adm_find') {
-    awaitingUserSearch.add(userId);
-    return editMessage(chatId, messageId,
-      `🔍 <b>Поиск юзера</b>\n\nОтправь одним сообщением:\n` +
-      `• tg_id — <code>1068105255</code>\n` +
-      `• @username — <code>@ivan</code>\n` +
-      `• имя — <code>Иван</code>`,
-      { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_back' }]] });
-  }
-
-  // ==== Карточка юзера ====
-  if (data.startsWith('usr_show_')) {
-    const tgId = Number(data.replace('usr_show_', ''));
-    return showUserCard(chatId, messageId, tgId);
-  }
-
-  // ==== Начислить примерки ====
-  if (data.startsWith('usr_add_custom_')) {
-    const tgId = Number(data.replace('usr_add_custom_', ''));
-    awaitingAddCustom.set(userId, tgId);
-    return editMessage(chatId, messageId,
-      `➕ <b>Своё число примерок</b>\n\nОтправь числом, сколько начислить (например <code>100</code>). Можно со знаком минус, чтобы списать: <code>-5</code>.`,
-      { inline_keyboard: [[{ text: '❌ Отмена', callback_data: `usr_show_${tgId}` }]] });
-  }
-
-  if (/^usr_add_\d+_\d+$/.test(data)) {
-    const parts = data.split('_');
-    const count = Number(parts[2]);
-    const tgId = Number(parts[3]);
-    try {
-      await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [count, tgId]);
-      return showUserCard(chatId, messageId, tgId, `Начислено +${count}`);
-    } catch (e) {
-      return editMessage(chatId, messageId, '❌ ' + e.message);
-    }
-  }
-
-  if (data.startsWith('usr_reset_')) {
-    const tgId = Number(data.replace('usr_reset_', ''));
-    await pool.query('UPDATE users SET balance = 0 WHERE tg_id = $1', [tgId]);
-    return showUserCard(chatId, messageId, tgId, 'Баланс обнулён');
-  }
-
-  if (data.startsWith('usr_unlimit_off_')) {
-    const tgId = Number(data.replace('usr_unlimit_off_', ''));
-    await pool.query('UPDATE users SET unlimited_until = NULL WHERE tg_id = $1', [tgId]);
-    return showUserCard(chatId, messageId, tgId, 'Безлимит снят');
-  }
-
-  if (data.startsWith('usr_unlimit_')) {
-    const tgId = Number(data.replace('usr_unlimit_', ''));
-    const until = new Date(Date.now() + 24 * 60 * 60 * 1000);
-    await pool.query('UPDATE users SET unlimited_until = $1 WHERE tg_id = $2', [until, tgId]);
-    return showUserCard(chatId, messageId, tgId, 'Безлимит на 24ч выдан');
-  }
-
-  if (data.startsWith('usr_delete_')) {
-    const tgId = Number(data.replace('usr_delete_', ''));
-    await pool.query('DELETE FROM users WHERE tg_id = $1', [tgId]);
-    return editMessage(chatId, messageId, `🗑 Юзер <code>${tgId}</code> удалён.`,
-      { inline_keyboard: [[{ text: '← К юзерам', callback_data: 'adm_users' }]] });
-  }
-
-  // ==== Промокоды ====
-  if (data === 'adm_promo_menu') {
-    return editMessage(chatId, messageId, '🎁 <b>Промокоды</b>', promoMenuKeyboard());
-  }
-
-  if (data === 'adm_promo_create') {
-    return editMessage(chatId, messageId, '🎁 <b>Создание промокода</b>\n\nВыбери номинал:', promoTypesKeyboard());
-  }
-
-  if (data.startsWith('adm_create_')) {
-    const type = data.replace('adm_create_', '');
-    let tries = 2, unlimited = false;
-    if (type === 'unlimited') unlimited = true;
-    else tries = Number(type) || 2;
-    const code = randomCode();
-    try {
-      await pool.query(
-        `INSERT INTO promo_codes (code, tries, unlimited, max_uses, is_active)
-         VALUES ($1, $2, $3, 1000, TRUE)`,
-        [code, tries, unlimited]
-      );
-      const reward = unlimited ? '💎 Безлимит 24 часа' : `🎁 +${tries} попыток`;
-      return editMessage(chatId, messageId,
-        `✅ <b>Промокод создан</b>\n\n🔑 Код: <code>${code}</code>\n${reward}\n📊 Лимит: 1000 активаций`,
-        {
-          inline_keyboard: [
-            [{ text: '➕ Создать ещё', callback_data: 'adm_promo_create' }],
-            [{ text: '← Назад', callback_data: 'adm_promo_menu' }],
-          ],
-        });
-    } catch (e) {
-      return editMessage(chatId, messageId, '❌ ' + e.message,
-        { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_promo_menu' }]] });
-    }
-  }
-
-  if (data === 'adm_promo_list') {
-    const r = await pool.query(
-      `SELECT code, tries, unlimited, used_count, max_uses, is_active
-       FROM promo_codes ORDER BY created_at DESC LIMIT 20`
-    );
-    if (!r.rows.length) return editMessage(chatId, messageId, '📋 Промокодов нет.',
-      { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_promo_menu' }]] });
-    let m = '📋 <b>Промокоды:</b>\n\n';
-    for (const p of r.rows) {
-      m += `<code>${p.code}</code> · ${p.unlimited ? '💎' : '+' + p.tries} · ${p.used_count}/${p.max_uses}${p.is_active ? '' : ' · ⛔'}\n`;
-    }
-    return editMessage(chatId, messageId, m,
-      { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_promo_menu' }]] });
-  }
-
-  if (data === 'adm_promo_delete') {
-    const r = await pool.query(`SELECT code FROM promo_codes WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 10`);
-    if (!r.rows.length) return editMessage(chatId, messageId, '❌ Активных нет.',
-      { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_promo_menu' }]] });
-    const btns = r.rows.map(p => ([{ text: '❌ ' + p.code, callback_data: 'adm_del_' + p.code }]));
-    btns.push([{ text: '← Назад', callback_data: 'adm_promo_menu' }]);
-    return editMessage(chatId, messageId, 'Выбери промокод для деактивации:', { inline_keyboard: btns });
-  }
-
-  if (data.startsWith('adm_del_')) {
-    const code = data.replace('adm_del_', '');
-    await pool.query('UPDATE promo_codes SET is_active = FALSE WHERE code = $1', [code]);
-    return editMessage(chatId, messageId, `✅ Промокод <code>${code}</code> деактивирован`,
-      {
-        inline_keyboard: [
-          [{ text: '❌ Ещё', callback_data: 'adm_promo_delete' }],
-          [{ text: '← Назад', callback_data: 'adm_promo_menu' }],
-        ],
-      });
-  }
-
-  // ==== Модерация каталога ====
-  if (data === 'adm_moderate') {
-    return editMessage(chatId, messageId,
-      '📌 <b>Каталог: модерация</b>\n\nЧто сделать с товаром?',
-      catalogMenuKeyboard());
-  }
-
-  if (['adm_pin', 'adm_unpin', 'adm_hide', 'adm_unhide'].includes(data)) {
-    const action = data.replace('adm_', '');
-    awaitingModeration.set(userId, action);
-    const prompts = {
-      pin: '📌 Отправь <b>wb_id</b> товара для закрепления:',
-      unpin: '✂️ Отправь <b>wb_id</b> товара для открепления:',
-      hide: '🙈 Отправь <b>wb_id</b> товара, чтобы скрыть:',
-      unhide: '👁 Отправь <b>wb_id</b> товара, чтобы вернуть:',
-    };
-    return editMessage(chatId, messageId, prompts[action],
-      { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_moderate' }]] });
-  }
-
-  // ==== Добавить товары по ссылкам ====
-  if (data === 'adm_add_links') {
-    awaitingLinks.add(userId);
-    return editMessage(chatId, messageId,
-      `➕ <b>Добавить товары по ссылкам</b>\n\n` +
-      `Отправь <b>одним сообщением</b> одну или несколько ссылок WB. Можно:\n\n` +
-      `• Полные ссылки: <code>https://www.wildberries.ru/catalog/183581368/detail.aspx</code>\n` +
-      `• Просто артикулы: <code>183581368</code>\n\n` +
-      `Можно миксовать и разделять пробелами, запятыми или переносами строк. Я вытащу все артикулы и добавлю их в каталог.`,
-      { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_back' }]] });
-  }
-
-  // ==== Очистка ====
-  if (data === 'adm_cleanup') {
-    try {
-      const r = await pool.query('SELECT deleted_count FROM cleanup_old_products()');
-      return editMessage(chatId, messageId,
-        `🧹 Очистка выполнена.\nУдалено товаров старше 5 дней: <b>${r.rows[0].deleted_count}</b>`,
-        { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]] });
-    } catch (e) {
-      return editMessage(chatId, messageId, '❌ ' + e.message,
-        { inline_keyboard: [[{ text: '← Назад', callback_data: 'adm_back' }]] });
-    }
-  }
-
-  // ==== Рассылка ====
-  if (data === 'adm_broadcast') {
-    awaitingBroadcast.add(userId);
-    return editMessage(chatId, messageId,
-      '📢 <b>Рассылка</b>\n\nНапиши текст сообщения — он уйдёт всем юзерам.',
-      { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'adm_back' }]] });
-  }
-}
-
-// ==== Обработка ввода: рассылка ====
-async function handleBroadcastText(msg) {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  if (!awaitingBroadcast.has(userId)) return false;
-  awaitingBroadcast.delete(userId);
-  const r = await pool.query('SELECT tg_id FROM users');
-  let sent = 0, fail = 0;
-  for (const u of r.rows) {
-    try {
-      await sendMessage(u.tg_id, msg.text);
-      sent++;
-      if (sent % 25 === 0) await new Promise(rs => setTimeout(rs, 1000));
-    } catch { fail++; }
-  }
-  await sendMessage(chatId, `✅ Отправлено: <b>${sent}</b>, ошибок: <b>${fail}</b>`, mainAdminKeyboard());
-  return true;
-}
-
-// ==== Обработка ввода: модерация ====
-async function handleModerationText(msg) {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const action = awaitingModeration.get(userId);
-  if (!action) return false;
-
-  const wbId = Number(msg.text.trim());
-  if (!wbId) { await sendMessage(chatId, '❌ Введи числовой wb_id'); return true; }
-
-  awaitingModeration.delete(userId);
-  try {
-    const exists = await pool.query('SELECT id, name FROM products WHERE wb_id = $1', [wbId]);
-    if (!exists.rows.length) {
-      await sendMessage(chatId, `❌ Товар ${wbId} не найден`, mainAdminKeyboard());
-      return true;
-    }
-    const name = exists.rows[0].name;
-    if (action === 'pin') await pool.query('UPDATE products SET is_pinned = TRUE WHERE wb_id = $1', [wbId]);
-    if (action === 'unpin') await pool.query('UPDATE products SET is_pinned = FALSE WHERE wb_id = $1', [wbId]);
-    if (action === 'hide') await pool.query('UPDATE products SET is_active = FALSE WHERE wb_id = $1', [wbId]);
-    if (action === 'unhide') await pool.query('UPDATE products SET is_active = TRUE WHERE wb_id = $1', [wbId]);
-    await sendMessage(chatId, `✅ Готово: <b>${name}</b>`, mainAdminKeyboard());
-    return true;
-  } catch (e) {
-    await sendMessage(chatId, '❌ ' + e.message, mainAdminKeyboard());
-    return true;
-  }
-}
-
-// ==== Обработка ввода: поиск юзера ====
-async function handleUserSearch(msg) {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  if (!awaitingUserSearch.has(userId)) return false;
-  awaitingUserSearch.delete(userId);
-
-  const q = msg.text.trim();
-  try {
-    let r;
-    if (/^\d+$/.test(q)) {
-      r = await pool.query('SELECT tg_id FROM users WHERE tg_id = $1', [Number(q)]);
-    } else if (q.startsWith('@')) {
-      r = await pool.query('SELECT tg_id FROM users WHERE LOWER(username) = LOWER($1)', [q.slice(1)]);
-    } else {
-      r = await pool.query('SELECT tg_id FROM users WHERE LOWER(first_name) LIKE LOWER($1) LIMIT 20', [`%${q}%`]);
-    }
-
-    if (!r.rows.length) {
-      await sendMessage(chatId, `❌ Никого не найдено по <code>${q}</code>`, mainAdminKeyboard());
-      return true;
-    }
-
-    if (r.rows.length === 1) {
-      return showUserCard(chatId, null, r.rows[0].tg_id, `Найден по "${q}"`);
-    }
-
-    const btns = r.rows.map(u => ([{ text: `ID ${u.tg_id}`, callback_data: `usr_show_${u.tg_id}` }]));
-    btns.push([{ text: '← Назад', callback_data: 'adm_users' }]);
-    await sendMessage(chatId, `🔍 Найдено ${r.rows.length}:`, { inline_keyboard: btns });
-    return true;
-  } catch (e) {
-    await sendMessage(chatId, '❌ ' + e.message, mainAdminKeyboard());
-    return true;
-  }
-}
-
-// ==== Обработка ввода: своё число примерок ====
-async function handleAddCustomText(msg) {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  if (!awaitingAddCustom.has(userId)) return false;
-  const targetTgId = awaitingAddCustom.get(userId);
-  awaitingAddCustom.delete(userId);
-
-  const n = Number(msg.text.trim());
-  if (!Number.isFinite(n) || n === 0) {
-    await sendMessage(chatId, '❌ Введи число (например 100 или -5)');
-    return true;
-  }
-
-  await pool.query('UPDATE users SET balance = GREATEST(0, balance + $1) WHERE tg_id = $2', [n, targetTgId]);
-  await showUserCard(chatId, null, targetTgId, `${n > 0 ? 'Начислено +' : 'Списано '}${n}`);
-  return true;
-}
-
-// ==== Обработка ввода: пачка ссылок ====
-async function handleLinksText(msg) {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  if (!awaitingLinks.has(userId)) return false;
-  awaitingLinks.delete(userId);
-
-  const ids = extractWbIds(msg.text);
-  if (!ids.length) {
-    await sendMessage(chatId,
-      `❌ Не нашёл ни одного артикула.\n\nПример:\n<code>https://www.wildberries.ru/catalog/183581368/detail.aspx</code>\nили просто <code>183581368</code>`,
-      mainAdminKeyboard());
-    return true;
-  }
-
-  await sendMessage(chatId, `⏳ Обрабатываю ${ids.length} товаров…`);
-
-  let added = 0, failed = 0;
-  const results = [];
-
-  for (const wbId of ids) {
-    try {
-      const info = await fetchWBProductInfo(wbId);
-      const name = info?.name || `Товар WB ${wbId}`;
-      const price = info?.price || null;
-      const category = guessCategory(name);
-      const imageUrl = primaryImageUrl(wbId);
-      const fallbackUrl = fallbackImageUrl(wbId);
-
-      await pool.query(
-        `INSERT INTO products (wb_id, name, price, category, image_url, fallback_url, is_active, source, updated_at, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,TRUE,'manual',NOW(),NOW())
-         ON CONFLICT (wb_id) DO UPDATE SET
-           name = EXCLUDED.name, price = EXCLUDED.price, category = EXCLUDED.category,
-           image_url = EXCLUDED.image_url, fallback_url = EXCLUDED.fallback_url,
-           is_active = TRUE, updated_at = NOW()`,
-        [wbId, name, price, category, imageUrl, fallbackUrl]
-      );
-      added++;
-      results.push(`✅ <code>${wbId}</code> — ${name.slice(0, 40)}`);
-    } catch (e) {
-      failed++;
-      results.push(`❌ <code>${wbId}</code> — ${e.message}`);
-    }
-  }
-
-  await sendMessage(chatId,
-    `📦 <b>Готово</b>\n\n✅ Добавлено: <b>${added}</b>\n❌ Ошибок: <b>${failed}</b>\n\n` +
-    results.slice(0, 30).join('\n') +
-    (results.length > 30 ? `\n…и ещё ${results.length - 30}` : ''),
-    mainAdminKeyboard());
-  return true;
-}
-
-function guessCategory(name) {
-  const n = (name || '').toLowerCase();
-  if (/(очки|оправа|повязк|ободок|заколк|шарф|бандана|сумк)/.test(n)) return 'accessory';
-  if (/(пальто|тренч|пуховик|шуба|плащ|ветровка|бомбер|дубленка|кожанк|куртк|жилет)/.test(n)) return 'outerwear';
-  if (/(костюм|комплект)/.test(n)) return 'suit';
-  if (/(платье|сарафан|юбка)/.test(n)) return 'dress';
-  if (/(блузка|рубашк|топ|майка|футболка|боди|корсет|водолазк|поло|лонгслив|кроп|бандо|худи|свитер|кардиган|джемпер|кофт)/.test(n)) return 'top';
-  if (/(брюк|джинс|штан|лосины|леггинс|шорт|карго)/.test(n)) return 'bottom';
-  return 'top';
-}
-
-// ============================================================
-// 12. WEBHOOK
-// ============================================================
-app.post('/api/webhook/telegram', async (req, res) => {
-  const update = req.body;
-
-  if (update.pre_checkout_query) {
-    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerPreCheckoutQuery`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pre_checkout_query_id: update.pre_checkout_query.id, ok: true }),
-    });
-    return res.sendStatus(200);
-  }
-
-  if (update.callback_query) {
-    try { await handleCallback(update.callback_query); } catch (e) { console.error('[cb]', e); }
-    return res.sendStatus(200);
-  }
-
-  if (update.message?.text) {
-    const text = update.message.text.trim();
-
-    // Сначала пробуем состояния
-    if (await handleBroadcastText(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handleModerationText(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handleUserSearch(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handleAddCustomText(update.message).catch(() => false)) return res.sendStatus(200);
-    if (await handleLinksText(update.message).catch(() => false)) return res.sendStatus(200);
-
-    // Потом команды
-    if (text === '/start') { await handleStart(update.message); return res.sendStatus(200); }
-    if (text === '/admin' || text === '/menu') { await handleAdminMenu(update.message); return res.sendStatus(200); }
-    return res.sendStatus(200);
-  }
-
-  if (update.message?.successful_payment) {
-    const pay = update.message.successful_payment;
-    const parts = (pay.invoice_payload || '').split(':');
-    const productType = parts[0];
-    const tgId = Number(parts[1]);
-    const chargeId = pay.telegram_payment_charge_id;
-    try {
-      const dup = await pool.query('SELECT 1 FROM payments WHERE charge_id = $1', [chargeId]);
-      if (!dup.rows.length) {
-        await pool.query(
-          'INSERT INTO payments (charge_id, tg_id, product, stars) VALUES ($1,$2,$3,$4)',
-          [chargeId, tgId, productType, pay.total_amount]
-        );
-        if (productType === 'pack10') {
-          await pool.query('UPDATE users SET balance = balance + 10 WHERE tg_id = $1', [tgId]);
-        } else if (productType === 'custom_tries') {
-          const n = Number(parts[2]) || 1;
-          await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [n, tgId]);
-        } else if (SUBSCRIPTIONS[productType]) {
-          const sub = SUBSCRIPTIONS[productType];
-          await pool.query(
-            `UPDATE users SET balance = balance + $1, own_tries = own_tries + $2, sub_active = TRUE WHERE tg_id = $3`,
-            [sub.tries, sub.own || 0, tgId]
-          );
-        }
-      }
-    } catch (e) { console.error('[webhook]', e); }
-  }
-  res.sendStatus(200);
-});
-
-// ============================================================
-// 13. HEALTH + CRON
-// ============================================================
-app.get('/', (_req, res) => res.send('GF Style Room API ✨'));
-app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
-
-cron.schedule('0 0,12 * * *', () => { refreshCatalog(); });
-
-cron.schedule('0 3 * * *', async () => {
-  try {
-    const r = await pool.query('SELECT deleted_count FROM cleanup_old_products()');
-    console.log(`[cron] cleanup: удалено ${r.rows[0].deleted_count}`);
-  } catch (e) { console.error('[cron] cleanup error:', e); }
-});
-
-pool.query('SELECT COUNT(*)::int AS c FROM products')
-  .then(r => { if (r.rows[0].c === 0) refreshCatalog(); })
-  .catch(() => {});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+    const users
