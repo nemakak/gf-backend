@@ -181,7 +181,7 @@ function guessCategory(name) {
 }
 
 // ============================================================
-// PUBLIC: SETTINGS (техобслуживание)
+// PUBLIC: SETTINGS
 // ============================================================
 app.get('/api/settings', async (_req, res) => {
   try {
@@ -255,19 +255,16 @@ app.get('/api/catalog', async (req, res) => {
 });
 
 // ============================================================
-// FAL helpers (с отменой запросов)
+// FAL helpers
 // ============================================================
 async function withTimeout(promise, ms, label, abortController = null) {
   let timeoutId;
   const timeoutPromise = new Promise((_, reject) => {
     timeoutId = setTimeout(() => {
-      if (abortController) {
-        abortController.abort();
-      }
+      if (abortController) abortController.abort();
       reject(new Error(`${label}: timeout ${ms}ms`));
     }, ms);
   });
-
   try {
     return await Promise.race([promise, timeoutPromise]);
   } finally {
@@ -307,7 +304,7 @@ async function fetchImageAsBase64(url) {
 }
 
 // ============================================================
-// TRYON — с отменой запросов при таймауте
+// TRYON — только Image Apps V2 ($0.04)
 // ============================================================
 async function runFalTryon({ humanImg, garmentUrl }) {
   let cleanGarmentUrl = garmentUrl;
@@ -333,44 +330,24 @@ async function runFalTryon({ humanImg, garmentUrl }) {
   }
 
   const t0 = Date.now();
-
-  // ШАГ 1: дешёвая image-apps-v2 — таймаут 30 секунд с отменой
-  console.log('[tryon] шаг 1: image-apps-v2 (30s, $0.04, с отменой)');
-  const controller1 = new AbortController();
+  console.log('[tryon] Image Apps V2 (30s, $0.04, с отменой)');
+  const controller = new AbortController();
   try {
     const url = await withTimeout(
       fal.subscribe('fal-ai/image-apps-v2/virtual-try-on', {
         input: { person_image_url: humanImg, clothing_image_url: garmentData },
         logs: false,
-        abortSignal: controller1.signal,
+        abortSignal: controller.signal,
       }).then(r => r?.data?.image?.url || r?.data?.images?.[0]?.url || null),
-      30000, 'image-apps-v2', controller1
+      30000, 'image-apps-v2', controller
     );
     if (url) {
-      console.log(`[tryon] ✅ image-apps-v2 OK за ${Date.now() - t0}ms`);
+      console.log(`[tryon] ✅ OK за ${Date.now() - t0}ms ($0.04)`);
       return { url, model: 'image-apps-v2' };
     }
   } catch (e) { logFalError('image-apps-v2', e); }
 
-  // ШАГ 2: дорогая fashn-v1.6 — таймаут 40 секунд с отменой
-  console.log('[tryon] шаг 2: fashn-v1.6 (40s, $0.075, резерв, с отменой)');
-  const controller2 = new AbortController();
-  try {
-    const url = await withTimeout(
-      fal.subscribe('fal-ai/fashn/tryon/v1.6', {
-        input: { model_image: humanImg, garment_image: garmentData, category: 'auto', mode: 'performance', acceleration: 'high' },
-        logs: false,
-        abortSignal: controller2.signal,
-      }).then(r => r?.data?.image?.url || r?.data?.images?.[0]?.url || null),
-      40000, 'fashn-v1.6', controller2
-    );
-    if (url) {
-      console.log(`[tryon] ✅ fashn-v1.6 OK за ${Date.now() - t0}ms (был резерв)`);
-      return { url, model: 'fashn-v1.6' };
-    }
-  } catch (e) { logFalError('fashn-v1.6', e); }
-
-  console.warn(`[tryon] все упали за ${Date.now() - t0}ms — НЕ списано`);
+  console.warn(`[tryon] упало за ${Date.now() - t0}ms — НЕ списано`);
   return { url: null, model: null };
 }
 
@@ -393,7 +370,7 @@ app.post('/api/tryon', async (req, res) => {
 
     const { url: resultUrl, model } = await runFalTryon({ humanImg, garmentUrl });
     if (!resultUrl) {
-      logError('tryon', 'Все модели упали', `itemId=${itemId}`);
+      logError('tryon', 'Модель упала', `itemId=${itemId}`);
       return res.json({ success: false, error: 'Не удалось сгенерировать. Попытки не списаны.' });
     }
     if (!hasUnlimited) await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
