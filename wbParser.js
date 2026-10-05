@@ -5,29 +5,42 @@ import { pool } from './db.js';
 const TOP_N = 30;
 const CLOUDFLARE_PROXY = 'https://gf-images.maxgamingbrawlstars.workers.dev';
 
-// Для каждого запроса — своя категория и фильтр
-const QUERIES = [
-  // Осень — первая и с осенними запросами
-  { q: 'женские осенние пальто',    cat: 'autumn',   autumn: true },
-  { q: 'женские осенние куртки',    cat: 'autumn',   autumn: true },
-  { q: 'женские тренчи',            cat: 'autumn',   autumn: true },
-  { q: 'женские демисезонные куртки', cat: 'autumn', autumn: true },
-  { q: 'женские платья',            cat: 'dress' },
-  { q: 'женские сарафаны',          cat: 'dress' },
-  { q: 'женские юбки',              cat: 'dress' },
-  { q: 'женские джинсы',            cat: 'bottom' },
-  { q: 'женские брюки',             cat: 'bottom' },
-  { q: 'женские шорты',             cat: 'bottom' },
-  { q: 'женские костюмы',           cat: 'suit' },
-  { q: 'женские куртки',            cat: 'outerwear' },
-  { q: 'женские пуховики',          cat: 'outerwear' },
-  { q: 'женские свитеры',           cat: 'top' },
-  { q: 'женские топы',              cat: 'top' },
-  { q: 'женские футболки',          cat: 'top' },
-  { q: 'женские худи',              cat: 'top' },
-];
+// Запросы по категориям
+const QUERIES_BY_CAT = {
+  autumn: [
+    'женские осенние пальто',
+    'женские тренчи',
+    'женские демисезонные куртки',
+    'женские осенние плащи',
+  ],
+  top: [
+    'женские свитеры',
+    'женские топы',
+    'женские футболки',
+    'женские худи',
+    'женские блузки',
+  ],
+  bottom: [
+    'женские джинсы',
+    'женские брюки',
+    'женские шорты',
+  ],
+  outerwear: [
+    'женские куртки',
+    'женские пуховики',
+    'женские жилеты',
+  ],
+  suit: [
+    'женские костюмы',
+    'женские комплекты',
+  ],
+  dress: [
+    'женские платья',
+    'женские сарафаны',
+    'женские юбки',
+  ],
+};
 
-// Проверка на "мужское"
 const MALE_WORDS = /\b(мужск|мужчин|для мужчин|male|boy|men)\b/i;
 
 function basketFor(id) {
@@ -43,7 +56,6 @@ function imageUrl(id) { return `https://spb-basket-cdn-03.geobasket.ru/vol${Math
 function fallbackUrl(id) { return `https://basket-${basketFor(id)}.wbbasket.ru/vol${Math.floor(id/100000)}/part${Math.floor(id/1000)}/${id}/images/big/1.webp`; }
 function formatPrice(p) { return p ? `${Math.round(p / 100).toLocaleString('ru-RU')} ₽` : null; }
 
-// Обрезаем название до ~150 символов
 function shortenName(name) {
   if (!name) return 'Товар';
   const clean = name.trim();
@@ -81,23 +93,22 @@ function headers() {
   };
 }
 
-// Попытка через Cloudflare Worker-прокси
-async function tryViaProxy(url) {
+async function tryFetch(url) {
+  // Сначала напрямую
+  try {
+    const r = await fetch(url, { headers: headers(), timeout: 12000 });
+    if (r.ok) {
+      const text = await r.text();
+      try { return JSON.parse(text); } catch { return null; }
+    }
+  } catch {}
+  // Потом через Cloudflare Worker
   try {
     const proxied = `${CLOUDFLARE_PROXY}/?url=${encodeURIComponent(url)}`;
-    const res = await fetch(proxied, { headers: headers(), timeout: 15000 });
-    if (!res.ok) return null;
-    const text = await res.text();
+    const r = await fetch(proxied, { headers: headers(), timeout: 15000 });
+    if (!r.ok) return null;
+    const text = await r.text();
     try { return JSON.parse(text); } catch { return null; }
-  } catch { return null; }
-}
-
-// Напрямую
-async function tryDirect(url) {
-  try {
-    const res = await fetch(url, { headers: headers(), timeout: 12000 });
-    if (!res.ok) return null;
-    return await res.json();
   } catch { return null; }
 }
 
@@ -108,84 +119,93 @@ async function fetchSearch(query) {
     suppressSpellcheck: 'false',
   });
 
+  // Актуальные endpoints WB (октябрь 2025)
   const endpoints = [
+    'https://search.wb.ru/exactmatch/ru/common/v13/search',
+    'https://search.wb.ru/exactmatch/ru/common/v9/search',
+    'https://u-search.wb.ru/exactmatch/ru/common/v13/search',
+    'https://u-search.wb.ru/exactmatch/ru/common/v9/search',
     'https://search.wb.ru/exactmatch/ru/common/v5/search',
     'https://search.wb.ru/exactmatch/ru/common/v4/search',
-    'https://u-search.wb.ru/exactmatch/ru/common/v4/search',
   ];
 
   for (const base of endpoints) {
-    const url = `${base}?${params}`;
-    // Сначала — напрямую
-    let data = await tryDirect(url);
-    // Если пусто — через прокси
-    if (!data || !data?.data?.products?.length) {
-      data = await tryViaProxy(url);
-    }
-    if (data?.data?.products?.length) return data.data.products;
+    const data = await tryFetch(`${base}?${params}`);
+    const products = data?.data?.products || data?.products || [];
+    if (products.length) return products;
   }
-  throw new Error('Все endpoints WB вернули пустоту');
+  throw new Error('Все endpoints WB вернули пустоту (403 или отключены)');
 }
 
-export async function refreshCatalog() {
+export async function refreshCatalog(categoryFilter = 'all') {
   const t0 = Date.now();
-  console.log('[wb] старт…');
-  let totalAdded = 0, totalUpdated = 0, totalSkipped = 0, successQueries = 0;
-  const errors = [];
+  console.log(`[wb] старт (category=${categoryFilter})…`);
 
-  for (const { q, cat, autumn } of QUERIES) {
-    let items = [];
-    try {
-      items = await fetchSearch(q);
-      if (items.length) successQueries++;
-    } catch (e) {
-      errors.push(`"${q}": ${e.message}`);
-      continue;
-    }
-
-    for (const p of items.slice(0, TOP_N)) {
-      const id = Number(p.id);
-      if (!id) continue;
-
-      const name = p.name || 'Товар';
-      // Фильтр мужских вещей
-      if (MALE_WORDS.test(name)) { totalSkipped++; continue; }
-
-      try {
-        const price = formatPrice(p.salePriceU ?? p.priceU);
-        const category = autumn ? 'autumn' : categorize(name, cat);
-        const img = imageUrl(id);
-        const fb = fallbackUrl(id);
-        const shortName = shortenName(name);
-
-        const existing = await pool.query('SELECT id FROM products WHERE wb_id = $1', [id]);
-        if (existing.rows.length) {
-          await pool.query(
-            `UPDATE products SET name=$1, price=$2, category=$3, image_url=$4, fallback_url=$5, updated_at=NOW() WHERE wb_id=$6`,
-            [shortName, price, category, img, fb, id]
-          );
-          totalUpdated++;
-        } else {
-          await pool.query(
-            `INSERT INTO products (wb_id, name, price, category, image_url, fallback_url, is_active, source, description, updated_at, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,TRUE,'auto',$7,NOW(),NOW())
-             ON CONFLICT (wb_id) DO NOTHING`,
-            [id, shortName, price, category, img, fb, shortName]
-          );
-          totalAdded++;
-        }
-      } catch { totalSkipped++; }
-      await new Promise(r => setTimeout(r, 50));
-    }
-    await new Promise(r => setTimeout(r, 500));
+  // Какие категории парсить
+  let catsToParse = Object.keys(QUERIES_BY_CAT);
+  if (categoryFilter && categoryFilter !== 'all') {
+    catsToParse = [categoryFilter];
   }
 
-  console.log(`[wb] ${Date.now() - t0}ms. +${totalAdded} ~${totalUpdated} ⊘${totalSkipped} (ok: ${successQueries}/${QUERIES.length})`);
+  let totalAdded = 0, totalUpdated = 0, totalSkipped = 0, successQueries = 0, totalQueries = 0;
+  const errors = [];
+
+  for (const cat of catsToParse) {
+    const queries = QUERIES_BY_CAT[cat] || [];
+    for (const q of queries) {
+      totalQueries++;
+      let items = [];
+      try {
+        items = await fetchSearch(q);
+        if (items.length) successQueries++;
+      } catch (e) {
+        errors.push(`"${q}": ${e.message}`);
+        continue;
+      }
+
+      for (const p of items.slice(0, TOP_N)) {
+        const id = Number(p.id);
+        if (!id) continue;
+        const name = p.name || 'Товар';
+        if (MALE_WORDS.test(name)) { totalSkipped++; continue; }
+
+        try {
+          const price = formatPrice(p.salePriceU ?? p.priceU);
+          const finalCat = cat === 'autumn' ? 'autumn' : categorize(name, cat);
+          const img = imageUrl(id);
+          const fb = fallbackUrl(id);
+          const shortName = shortenName(name);
+          const srcUrl = `https://www.wildberries.ru/catalog/${id}/detail.aspx`;
+
+          const existing = await pool.query('SELECT id FROM products WHERE wb_id = $1', [id]);
+          if (existing.rows.length) {
+            await pool.query(
+              `UPDATE products SET name=$1, price=$2, category=$3, image_url=$4, fallback_url=$5, source_url=$6, updated_at=NOW() WHERE wb_id=$7`,
+              [shortName, price, finalCat, img, fb, srcUrl, id]
+            );
+            totalUpdated++;
+          } else {
+            await pool.query(
+              `INSERT INTO products (wb_id, name, price, category, image_url, fallback_url, is_active, source, description, source_url, updated_at, created_at)
+               VALUES ($1,$2,$3,$4,$5,$6,TRUE,'auto',$7,$8,NOW(),NOW())
+               ON CONFLICT (wb_id) DO NOTHING`,
+              [id, shortName, price, finalCat, img, fb, shortName, srcUrl]
+            );
+            totalAdded++;
+          }
+        } catch { totalSkipped++; }
+        await new Promise(r => setTimeout(r, 50));
+      }
+      await new Promise(r => setTimeout(r, 400));
+    }
+  }
+
+  console.log(`[wb] ${Date.now() - t0}ms. +${totalAdded} ~${totalUpdated} ⊘${totalSkipped} (ok: ${successQueries}/${totalQueries})`);
 
   if (successQueries === 0) {
     return {
       added: 0, updated: 0, failed: 0, success: false,
-      reason: 'WB не отдал результаты. Возможно, изменены endpoints или IP заблокирован.',
+      reason: `WB не отдал ни один товар. Попробуй через VPN или проверь Cloudflare Worker.`,
       errors,
     };
   }
