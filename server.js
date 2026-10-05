@@ -322,6 +322,73 @@ app.post('/api/auth', async (req, res) => {
   } catch (e) { logError('auth', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
+// ============================================================
+// ADMIN: пополнение каталога и добавление товаров по ссылкам
+// ============================================================
+
+// 1) Пополнение каталога из WB
+app.post('/api/admin/refresh-catalog', async (req, res) => {
+  const { initData, category } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const cat = category || 'all';
+    // 'all' — тянет все категории, включая Осень, параллельно
+    const result = await refreshCatalog(cat);
+    res.json(result);
+  } catch (e) {
+    logError('admin-refresh', e.message);
+    res.status(500).json({ success: false, reason: e.message, error: e.message });
+  }
+});
+
+// 2) Добавление товаров по ссылкам WB (свои товары)
+app.post('/api/admin/add-links', async (req, res) => {
+  const { initData, links } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  if (!links || !String(links).trim()) return res.status(400).json({ error: 'Пусто' });
+
+  const ids = extractWbIds(String(links));
+  if (!ids.length) return res.status(400).json({ error: 'Не нашёл артикулы WB' });
+
+  const results = [];
+  for (let i = 0; i < ids.length; i += 5) {
+    const chunk = ids.slice(i, i + 5);
+    const chunkRes = await Promise.all(chunk.map(async (wbId) => {
+      try {
+        const info = await fetchWBProductInfo(wbId);
+        const name = info?.name || `Товар ${wbId}`;
+        const price = info?.price || null;
+        const category = guessCategory(name);
+        const img = primaryImageUrl(wbId);
+        const fb = fallbackImageUrl(wbId);
+        const srcUrl = `https://www.wildberries.ru/catalog/${wbId}/detail.aspx`;
+
+        await pool.query(
+          `INSERT INTO products (wb_id, name, price, category, image_url, fallback_url, is_active, source, description, source_url, updated_at, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,TRUE,'manual',$7,$8,NOW(),NOW())
+           ON CONFLICT (wb_id) DO UPDATE SET
+             name=EXCLUDED.name, price=EXCLUDED.price, category=EXCLUDED.category,
+             image_url=EXCLUDED.image_url, fallback_url=EXCLUDED.fallback_url,
+             is_active=TRUE, description=EXCLUDED.description, source_url=EXCLUDED.source_url,
+             updated_at=NOW()`,
+          [wbId, name, price, category, img, fb, info?.description || name, srcUrl]
+        );
+        return { wbId, ok: true, name, price, category };
+      } catch (e) {
+        return { wbId, ok: false, error: e.message };
+      }
+    }));
+    results.push(...chunkRes);
+  }
+
+  const ok = results.filter(r => r.ok);
+  res.json({ success: true, added: ok.length, failed: results.length - ok.length, items: ok });
+});
+
 app.get('/api/settings', async (_req, res) => {
   try {
     const maintenance = await isMaintenanceMode();
