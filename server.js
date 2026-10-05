@@ -1510,6 +1510,90 @@ cron.schedule('* * * * *', async () => {
 });
 
 pool.query('SELECT COUNT(*)::int AS c FROM products').then(r => { if (r.rows[0].c === 0) refreshCatalog(); }).catch(() => {});
+// ============================================================
+// ПОИСК: сортировка по совпадениям + морфология
+// ============================================================
+app.get('/api/search', async (req, res) => {
+  const raw = String(req.query.q || '').trim().toLowerCase();
+  const limit = Math.min(100, Number(req.query.limit) || 50);
+  if (raw.length < 2) return res.json({ success: true, items: [] });
+
+  try {
+    const words = raw.split(/\s+/).filter(w => w.length >= 2);
+    if (!words.length) return res.json({ success: true, items: [] });
+
+    const roots = words.map(w => {
+      if (w.length <= 4) return w;
+      return w.replace(/(иями|ями|ами|ией|иях|иям|ию|ия|ие|ые|ых|ой|ый|ая|ое|ов|ам|ах|ям|ях|ом|ем|у|ю|ы|и|а|я|е|о|й|ь)$/u, '')
+        || w.slice(0, Math.max(3, w.length - 2));
+    });
+
+    const params = [];
+    const scoreParts = [];
+    const whereParts = [];
+
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i];
+      const r = roots[i];
+
+      params.push(`%${w}%`, `%${r}%`);
+      const wIdx = params.length - 1;
+      const rIdx = params.length;
+
+      whereParts.push(`(LOWER(name) LIKE $${wIdx} OR LOWER(name) LIKE $${rIdx})`);
+
+      scoreParts.push(`(CASE WHEN LOWER(name) LIKE $${wIdx} OR LOWER(name) LIKE $${rIdx} THEN 1 ELSE 0 END)`);
+
+      params.push(`${w}%`);
+      scoreParts.push(`(CASE WHEN LOWER(name) LIKE $${params.length} THEN 2 ELSE 0 END)`);
+    }
+
+    params.push(String(Date.now()));
+    const seedIdx = params.length;
+    params.push(limit);
+    const limitIdx = params.length;
+
+    const sql = `
+      SELECT
+        id, wb_id, name, price, category, image_url, fallback_url, description, source_url,
+        (${scoreParts.join(' + ')}) AS match_score
+      FROM products
+      WHERE is_active = TRUE
+        AND (${whereParts.join(' OR ')})
+      ORDER BY
+        match_score DESC,
+        MD5(id::text || $${seedIdx}) ASC
+      LIMIT $${limitIdx}
+    `;
+
+    const r = await pool.query(sql, params);
+    const items = r.rows.map(({ match_score, ...rest }) => rest);
+    res.json({ success: true, items, count: items.length });
+  } catch (e) {
+    logError('search', e.message);
+    try {
+      const words = raw.split(/\s+/).filter(w => w.length >= 2);
+      if (!words.length) return res.json({ success: true, items: [] });
+      const params = [];
+      const conds = words.map(w => {
+        params.push(`%${w}%`);
+        return `LOWER(name) LIKE $${params.length}`;
+      });
+      params.push(limit);
+      const sql = `
+        SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
+        FROM products
+        WHERE is_active = TRUE AND (${conds.join(' OR ')})
+        ORDER BY MD5(id::text || '${Date.now()}') ASC
+        LIMIT $${params.length}
+      `;
+      const r = await pool.query(sql, params);
+      res.json({ success: true, items: r.rows, fallback: true });
+    } catch (e2) {
+      res.status(500).json({ error: 'Server error' });
+    }
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
