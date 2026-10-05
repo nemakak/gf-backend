@@ -1405,7 +1405,83 @@ app.post('/api/webhook/telegram', async (req, res) => {
   }
   res.sendStatus(200);
 });
+// ============================================================
+// ADMIN endpoints
+// ============================================================
 
+// 1) Пополнение каталога — вызывается из админки
+app.post('/api/admin/refresh-catalog', async (req, res) => {
+  const { initData, category } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+
+  try {
+    const cat = category || 'all';
+    // refreshCatalog работает и с 'all', и с отдельной категорией
+    const result = await refreshCatalog(cat);
+    res.json(result);
+  } catch (e) {
+    logError('admin-refresh', e.message);
+    res.status(500).json({ success: false, reason: e.message, error: e.message });
+  }
+});
+
+// 2) Список всех товаров для подчистки
+app.post('/api/admin/products/list', async (req, res) => {
+  const { initData, category } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+
+  try {
+    const params = [];
+    let where = 'WHERE 1=1';
+    if (category && category !== 'all') {
+      params.push(category);
+      where += ` AND category = $${params.length}`;
+    }
+    const r = await pool.query(
+      `SELECT id, wb_id, name, price, category, image_url, fallback_url, is_active, is_pinned
+       FROM products ${where}
+       ORDER BY is_pinned DESC NULLS LAST, updated_at DESC NULLS LAST, id DESC
+       LIMIT 500`,
+      params
+    );
+    res.json({ success: true, items: r.rows });
+  } catch (e) {
+    logError('admin-products-list', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 3) Действия над товаром: pin/unpin/hide/unhide/delete
+app.post('/api/admin/products/action', async (req, res) => {
+  const { initData, action, productId, wbId } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+
+  if (!productId) return res.status(400).json({ error: 'productId обязателен' });
+
+  try {
+    let sql = null;
+    let msg = '';
+    switch (action) {
+      case 'pin':     sql = `UPDATE products SET is_pinned = TRUE  WHERE id = $1`; msg = '📌 Закреплено'; break;
+      case 'unpin':   sql = `UPDATE products SET is_pinned = FALSE WHERE id = $1`; msg = '📌 Откреплено'; break;
+      case 'hide':    sql = `UPDATE products SET is_active = FALSE WHERE id = $1`; msg = '🙈 Скрыто'; break;
+      case 'unhide':  sql = `UPDATE products SET is_active = TRUE, is_pinned = FALSE WHERE id = $1`; msg = '👁 Возвращено'; break;
+      case 'delete':  sql = `DELETE FROM products WHERE id = $1`; msg = '🗑 Удалено'; break;
+      default: return res.status(400).json({ error: 'Неизвестное действие' });
+    }
+    await pool.query(sql, [productId]);
+    res.json({ success: true, message: msg });
+  } catch (e) {
+    logError('admin-product-action', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 app.get('/', (_req, res) => res.send('GF Style Room API ✨'));
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
