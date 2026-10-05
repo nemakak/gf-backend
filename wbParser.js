@@ -5,13 +5,14 @@ import { pool } from './db.js';
 const TOP_N = 30;
 const CLOUDFLARE_PROXY = 'https://gf-images.maxgamingbrawlstars.workers.dev';
 
-// Запросы по категориям
 const QUERIES_BY_CAT = {
   autumn: [
     'женские осенние пальто',
     'женские тренчи',
     'женские демисезонные куртки',
     'женские осенние плащи',
+    'женские пальто женские',
+    'женские осенние куртки женские',
   ],
   top: [
     'женские свитеры',
@@ -19,25 +20,31 @@ const QUERIES_BY_CAT = {
     'женские футболки',
     'женские худи',
     'женские блузки',
+    'женские кардиганы',
+    'женские рубашки',
   ],
   bottom: [
     'женские джинсы',
     'женские брюки',
     'женские шорты',
+    'женские леггинсы',
   ],
   outerwear: [
     'женские куртки',
     'женские пуховики',
     'женские жилеты',
+    'женские шубы',
   ],
   suit: [
     'женские костюмы',
     'женские комплекты',
+    'женские костюмы двойки',
   ],
   dress: [
     'женские платья',
     'женские сарафаны',
     'женские юбки',
+    'женские платья вечерние',
   ],
 };
 
@@ -94,7 +101,6 @@ function headers() {
 }
 
 async function tryFetch(url) {
-  // Сначала напрямую
   try {
     const r = await fetch(url, { headers: headers(), timeout: 12000 });
     if (r.ok) {
@@ -102,7 +108,6 @@ async function tryFetch(url) {
       try { return JSON.parse(text); } catch { return null; }
     }
   } catch {}
-  // Потом через Cloudflare Worker
   try {
     const proxied = `${CLOUDFLARE_PROXY}/?url=${encodeURIComponent(url)}`;
     const r = await fetch(proxied, { headers: headers(), timeout: 15000 });
@@ -119,7 +124,6 @@ async function fetchSearch(query) {
     suppressSpellcheck: 'false',
   });
 
-  // Актуальные endpoints WB (октябрь 2025)
   const endpoints = [
     'https://search.wb.ru/exactmatch/ru/common/v13/search',
     'https://search.wb.ru/exactmatch/ru/common/v9/search',
@@ -141,7 +145,6 @@ export async function refreshCatalog(categoryFilter = 'all') {
   const t0 = Date.now();
   console.log(`[wb] старт (category=${categoryFilter})…`);
 
-  // Какие категории парсить
   let catsToParse = Object.keys(QUERIES_BY_CAT);
   if (categoryFilter && categoryFilter !== 'all') {
     catsToParse = [categoryFilter];
