@@ -1018,7 +1018,27 @@ async function handleCallback(cb) {
     return editMessage(chatId, messageId, `🔥 Стрик ${cur ? 'ВЫКЛЮЧЕН' : 'ВКЛЮЧЁН'}. Число у юзеров сохранено.`, globalsKeyboard(!cur));
   }
 
-  if (data === 'adm_refresh_catalog') {
+  if (data === 'adm_refresh_catalog') {     return editMessage(chatId, messageId,       '🔄 <b>Пополнить каталог</b>
+
+Что тянем из WB?',       { inline_keyboard: [         [{ text: '🌍 Все категории', callback_data: 'adm_rc_all' }],         [{ text: '🍂 Только Осень', callback_data: 'adm_rc_autumn' }],         [{ text: '👕 Только Верх', callback_data: 'adm_rc_top' }],         [{ text: '👖 Только Низ', callback_data: 'adm_rc_bottom' }],         [{ text: '🧥 Только Верхняя одежда', callback_data: 'adm_rc_outerwear' }],         [{ text: '🥼 Только Костюмы', callback_data: 'adm_rc_suit' }],         [{ text: '👗 Только Платья', callback_data: 'adm_rc_dress' }],         [{ text: '← К каталогу', callback_data: 'adm_catalog' }],       ]});   }   if (data.startsWith('adm_rc_')) {     const cat = data.replace('adm_rc_', '');     const catLabels = { all: 'все категории', autumn: 'Осень', top: 'Верх', bottom: 'Низ', outerwear: 'Верхняя одежда', suit: 'Костюмы', dress: 'Платья' };     await editMessage(chatId, messageId, `🔄 <b>Пополняю «${catLabels[cat] || cat}»…</b>
+
+Это займёт до 1–2 минут.`, catBack);     try {       const result = await refreshCatalog(cat === 'all' ? 'all' : cat);        let msg;       if (!result.success) {         msg = `❌ <b>Не удалось</b>
+
+${result.reason}
+
+` + (result.errors && result.errors.length ? `Первые ошибки:
+${result.errors.slice(0, 3).map(e => '• ' + e).join('
+')}` : '');       } else if (result.added === 0 && result.updated === 0) {         msg = `⚠️ <b>Не добавлено ничего нового</b>
+
+Категория: <b>${catLabels[cat] || cat}</b>
+
+Все товары уже в базе.`;       } else {         msg = `✅ <b>Готово!</b>
+
+Категория: <b>${catLabels[cat] || cat}</b>
+
+➕ Новых: <b>${result.added}</b>
+🔄 Обновлено: <b>${result.updated}</b>
+⊘ Пропущено: <b>${result.failed}</b>`;       }       for (const a of admins.rows) sendMessage(a.tg_id, msg, catBack).catch(() => {});     } catch (e) {       logError('refresh-catalog', e.message);       for (const a of admins.rows) sendMessage(a.tg_id, `❌ Ошибка: ${e.message}`, catBack).catch(() => {});     }     return;   }
     await editMessage(chatId, messageId, `🔄 <b>Пополняю каталог…</b>\n\nЭто займёт до 1–2 минут.`, catBack);
     try {
       const result = await refreshCatalog();
