@@ -1595,5 +1595,85 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
+// ============================================================
+// ПЕРСОНАЛЬНЫЙ КАТАЛОГ — на основе истории просмотров
+// ============================================================
+app.get('/api/catalog-personal', async (req, res) => {
+  const initData = req.headers['x-init-data'] || '';
+  const limit = Math.min(50, Number(req.query.limit) || 40);
+  const tgUser = verifyTelegramInitData(initData);
+
+  // Гость — отдаём случайные
+  if (!tgUser) {
+    try {
+      const r = await pool.query(
+        `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
+         FROM products WHERE is_active = TRUE
+         ORDER BY RANDOM() LIMIT $1`, [limit]
+      );
+      return res.json({ success: true, items: r.rows, personalized: false });
+    } catch { return res.json({ success: true, items: [] }); }
+  }
+
+  try {
+    // 1) Любимые категории по просмотрам и примеркам за 30 дней
+    const prefs = await pool.query(
+      `SELECT category, COUNT(*)::int AS c
+       FROM product_views
+       WHERE user_id = $1 AND viewed_at > NOW() - INTERVAL '30 days' AND category IS NOT NULL
+       GROUP BY category ORDER BY c DESC LIMIT 3`,
+      [tgUser.id]
+    );
+
+    const topCats = prefs.rows.map(x => x.category);
+
+    // 2) Если истории мало — добавляем категории по примеркам
+    if (topCats.length < 2) {
+      const tried = await pool.query(
+        `SELECT p.category, COUNT(*)::int AS c
+         FROM tryon_history t JOIN products p ON p.id = t.product_id
+         WHERE t.user_id = $1 AND t.created_at > NOW() - INTERVAL '30 days'
+         GROUP BY p.category ORDER BY c DESC LIMIT 3`,
+        [tgUser.id]
+      );
+      for (const row of tried.rows) {
+        if (row.category && !topCats.includes(row.category)) topCats.push(row.category);
+      }
+    }
+
+    // 3) Если совсем ничего — рандом
+    if (!topCats.length) {
+      const r = await pool.query(
+        `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
+         FROM products WHERE is_active = TRUE ORDER BY RANDOM() LIMIT $1`, [limit]
+      );
+      return res.json({ success: true, items: r.rows, personalized: false });
+    }
+
+    // 4) 70% — из любимых категорий, 30% — остальное
+    const favLimit = Math.ceil(limit * 0.7);
+    const randLimit = limit - favLimit;
+
+    const fav = await pool.query(
+      `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
+       FROM products WHERE is_active = TRUE AND category = ANY($1)
+       ORDER BY RANDOM() LIMIT $2`,
+      [topCats, favLimit]
+    );
+    const rand = await pool.query(
+      `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
+       FROM products WHERE is_active = TRUE AND category != ALL($1)
+       ORDER BY RANDOM() LIMIT $2`,
+      [topCats, randLimit]
+    );
+
+    const items = [...fav.rows, ...rand.rows].sort(() => Math.random() - 0.5);
+    res.json({ success: true, items, personalized: true, topCats });
+  } catch (e) {
+    logError('catalog-personal', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
