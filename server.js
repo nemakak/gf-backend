@@ -1717,4 +1717,91 @@ app.post('/debug-auth', (req, res) => {
     hashMatch: hash === calc,
   });
 });
+// ============================================================
+// ПЕРСОНАЛИЗАЦИЯ (сохранить ответы теста)
+// ============================================================
+app.post('/api/save-personalization', async (req, res) => {
+  const { initData, answers } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS personalization JSONB`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS personalized BOOLEAN DEFAULT FALSE`);
+    await pool.query(
+      `UPDATE users SET personalization = $1, personalized = TRUE WHERE tg_id = $2`,
+      [JSON.stringify(answers || {}), tgUser.id]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    logError('save-personalization', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
+// ПЕРСОНАЛЬНЫЙ КАТАЛОГ (уже учитывает тест)
+// ============================================================
+app.get('/api/catalog-personal', async (req, res) => {
+  const initData = req.headers['x-init-data'] || '';
+  const limit = Math.min(50, Number(req.query.limit) || 40);
+  const tgUser = verifyTelegramInitData(initData);
+
+  if (!tgUser) {
+    try {
+      const r = await pool.query(
+        `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
+         FROM products WHERE is_active = TRUE ORDER BY RANDOM() LIMIT $1`, [limit]);
+      return res.json({ success: true, items: r.rows, personalized: false });
+    } catch { return res.json({ success: true, items: [] }); }
+  }
+
+  try {
+    // 1) Категории из истории
+    const prefs = await pool.query(
+      `SELECT category, COUNT(*)::int AS c
+       FROM product_views
+       WHERE user_id = $1 AND viewed_at > NOW() - INTERVAL '30 days' AND category IS NOT NULL
+       GROUP BY category ORDER BY c DESC LIMIT 3`,
+      [tgUser.id]
+    );
+    let topCats = prefs.rows.map(x => x.category);
+
+    // 2) Из ответов персонализации
+    const u = await pool.query('SELECT personalization FROM users WHERE tg_id = $1', [tgUser.id]);
+    const p = u.rows[0]?.personalization || {};
+    if (p.style_cat && !topCats.includes(p.style_cat)) topCats.unshift(p.style_cat);
+    if (p.season_cat && !topCats.includes(p.season_cat)) topCats.push(p.season_cat);
+
+    // 3) Если пусто — рандом
+    if (!topCats.length) {
+      const r = await pool.query(
+        `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
+         FROM products WHERE is_active = TRUE ORDER BY RANDOM() LIMIT $1`, [limit]);
+      return res.json({ success: true, items: r.rows, personalized: false });
+    }
+
+    // 70% любимых + 30% остальных
+    const favLimit = Math.ceil(limit * 0.7);
+    const randLimit = limit - favLimit;
+
+    const fav = await pool.query(
+      `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
+       FROM products WHERE is_active = TRUE AND category = ANY($1)
+       ORDER BY RANDOM() LIMIT $2`,
+      [topCats, favLimit]
+    );
+    const rand = await pool.query(
+      `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
+       FROM products WHERE is_active = TRUE AND category != ALL($1)
+       ORDER BY RANDOM() LIMIT $2`,
+      [topCats, randLimit]
+    );
+
+    const items = [...fav.rows, ...rand.rows].sort(() => Math.random() - 0.5);
+    res.json({ success: true, items, personalized: true, topCats });
+  } catch (e) {
+    logError('catalog-personal', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
