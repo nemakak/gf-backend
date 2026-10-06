@@ -323,6 +323,7 @@ app.post('/api/auth', async (req, res) => {
           await pool.query('UPDATE users SET streak_days=$1, last_streak_date=CURRENT_DATE WHERE tg_id=$2', [newStreak, tgId]);
           streakDays = newStreak;
         } else {
+        }
           streakDays = user.streak_days || 1;
         }
       } else {
