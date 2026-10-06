@@ -586,25 +586,34 @@ async function cropGarmentByCategory(imageUrl, category) {
   }
 }
 
-async function runFalTryon({ humanImg, garmentUrl }) {
+async function runFalTryon({ humanImg, garmentUrl, category }) {
   let cleanGarmentUrl = garmentUrl;
   if (typeof cleanGarmentUrl === 'string') {
     const m = cleanGarmentUrl.match(/^(.*\/images\/[a-z0-9]+)(\/(\d+\.[a-z]+))?$/i);
     if (m && !m[3]) cleanGarmentUrl = `${m[1]}/1.webp`;
   }
 
-  let garmentData = cleanGarmentUrl;
+  // Сначала пробуем обрезать по категории
+  let garmentData = null;
   if (cleanGarmentUrl && cleanGarmentUrl.startsWith('http') && !cleanGarmentUrl.startsWith('data:')) {
-    const b64 = await fetchImageAsBase64(cleanGarmentUrl);
-    if (b64) garmentData = b64;
-    else {
-      const wbMatch = cleanGarmentUrl.match(/\/(\d{6,})\//);
-      if (wbMatch) {
-        const wbId = Number(wbMatch[1]);
-        for (const size of ['big', 'c516x688', 'c246x328']) {
-          const alt = `https://basket-${basketFor(wbId)}.wbbasket.ru/vol${Math.floor(wbId/100000)}/part${Math.floor(wbId/1000)}/${wbId}/images/${size}/1.webp`;
-          const altB64 = await fetchImageAsBase64(alt);
-          if (altB64) { garmentData = altB64; break; }
+    garmentData = await cropGarmentByCategory(cleanGarmentUrl, category);
+  }
+
+  // Если обрезка не сработала — берём обычную картинку
+  if (!garmentData) {
+    garmentData = cleanGarmentUrl;
+    if (cleanGarmentUrl && cleanGarmentUrl.startsWith('http') && !cleanGarmentUrl.startsWith('data:')) {
+      const b64 = await fetchImageAsBase64(cleanGarmentUrl);
+      if (b64) garmentData = b64;
+      else {
+        const wbMatch = cleanGarmentUrl.match(/\/(\d{6,})\//);
+        if (wbMatch) {
+          const wbId = Number(wbMatch[1]);
+          for (const size of ['big', 'c516x688', 'c246x328']) {
+            const alt = `https://basket-${basketFor(wbId)}.wbbasket.ru/vol${Math.floor(wbId/100000)}/part${Math.floor(wbId/1000)}/${wbId}/images/${size}/1.webp`;
+            const altB64 = await fetchImageAsBase64(alt);
+            if (altB64) { garmentData = altB64; break; }
+          }
         }
       }
     }
@@ -618,7 +627,6 @@ async function runFalTryon({ humanImg, garmentUrl }) {
           person_image_url: humanImg,
           clothing_image_url: garmentData,
           prompt: 'Same person, same pose, same face, same body, same hair, same skin tone, same background, same lighting. Only change the clothing to match the garment.',
-          negative_prompt: 'different face, different person, changed pose, changed body, different background, different lighting, deformed face',
         },
         logs: false,
         abortSignal: controller.signal,
