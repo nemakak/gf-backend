@@ -324,11 +324,7 @@ app.post('/api/auth', async (req, res) => {
         } else {
           streakDays = user.streak_days || 1;
         }
-      } else {
-        streakDays = user.streak_days || 0;
-      }
-
-        const lastDaily = user.last_daily_bonus ? new Date(user.last_daily_bonus).toISOString().slice(0, 10) : null;
+             const lastDaily = user.last_daily_bonus ? new Date(user.last_daily_bonus).toISOString().slice(0, 10) : null;
         if (lastDaily !== today && streakDays % 5 !== 0) {
           await pool.query('UPDATE users SET balance = balance + $1, last_daily_bonus = CURRENT_DATE WHERE tg_id = $2', [dailyBonusTries, tgId]);
           dailyBonus = dailyBonusTries;
@@ -336,9 +332,6 @@ app.post('/api/auth', async (req, res) => {
         } else if (lastDaily !== today) {
           await pool.query('UPDATE users SET last_daily_bonus = CURRENT_DATE WHERE tg_id = $1', [tgId]);
         }
-      } else {
-        streakDays = user.streak_days || 0;
-      }
     }
 
     let oneTimeMsg = null;
