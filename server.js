@@ -712,7 +712,7 @@ app.post('/api/tryon-by-link', async (req, res) => {
     const info = await fetchWBProductInfo(wbId);
     const garmentUrl = primaryImageUrl(wbId);
     const productName = info?.name || `Товар ${wbId}`;
-        const { url: resultUrl, model } = await runFalTryon({ humanImg, garmentUrl });
+        const { url: resultUrl, model } = await runFalTryon({ humanImg, garmentUrl, category: 'all' });
     await logGeneration(tgId, model, !!resultUrl, null);
     if (!resultUrl) {
       return res.json({
@@ -754,7 +754,7 @@ app.post('/api/tryon-multi', async (req, res) => {
     if (!hasUnlimited && user.balance < need) return res.status(402).json({ error: `Нужно ${need} попыток` });
     const results = []; let prevImg = humanImg; let success = 0;
     for (const item of items) {
-      const { url, model } = await runFalTryon({ humanImg: prevImg, garmentUrl: item.image_url });
+      const { url, model } = await runFalTryon({ humanImg: prevImg, garmentUrl: item.image_url, category: item.category });
       await logGeneration(tgId, model, !!url, item.id);
       if (url) { results.push({ itemId: item.id, name: item.name, url }); prevImg = url; success++; }
       else results.push({ itemId: item.id, name: item.name, url: null });
