@@ -667,7 +667,7 @@ app.post('/api/tryon', async (req, res) => {
     if (user.is_banned) return res.status(403).json({ error: 'Вы заблокированы' });
     const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
     if (!hasUnlimited && user.balance <= 0) return res.status(402).json({ error: 'Нет попыток' });
-    const { url: resultUrl, model } = await runFalTryon({ humanImg, garmentUrl });
+    const { url: resultUrl, model } = await runFalTryon({ humanImg, garmentUrl, category });
     await logGeneration(tgId, model, !!resultUrl, itemId);
     if (!resultUrl) return res.json({ success: false, error: 'Не получилось. Попробуй другое фото.' });
     if (!hasUnlimited) await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
