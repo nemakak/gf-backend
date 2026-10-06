@@ -289,14 +289,13 @@ app.post('/api/auth', async (req, res) => {
       const upd = await pool.query(`UPDATE users SET first_name=$1, username=$2, photo_url=$3, last_active=NOW() WHERE tg_id=$4 RETURNING *`, [first_name || null, username || null, photo_url || null, tgId]);
       user = upd.rows[0];
 
-            if (streakEnabled) {
+               if (streakEnabled) {
         const lastStreak = user.last_streak_date ? new Date(user.last_streak_date).toISOString().slice(0, 10) : null;
         if (lastStreak !== today) {
           const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
           let newStreak = (lastStreak === yesterday) ? (user.streak_days || 0) + 1 : 1;
           const dayInCycle = ((newStreak - 1) % 5) + 1;
 
-          // Читаем награду из БД
           let reward = { enabled: true, tries: 0, own_tries: 0, text: '' };
           try {
             const rr = await pool.query('SELECT * FROM streak_rewards WHERE day = $1', [dayInCycle]);
@@ -323,7 +322,7 @@ app.post('/api/auth', async (req, res) => {
           await pool.query('UPDATE users SET streak_days=$1, last_streak_date=CURRENT_DATE WHERE tg_id=$2', [newStreak, tgId]);
           streakDays = newStreak;
         } else {
-         streakDays = user.streak_days || 1;
+          streakDays = user.streak_days || 1;
         }
       } else {
         streakDays = user.streak_days || 0;
