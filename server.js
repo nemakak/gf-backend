@@ -1696,4 +1696,20 @@ app.get('/api/catalog-personal', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+app.post('/debug-auth', (req, res) => {
+  const initData = (req.body && req.body.initData) || '';
+  const p = new URLSearchParams(initData);
+  const hash = p.get('hash') || '';
+  p.delete('hash');
+  const str = [...p.entries()].sort().map(([k, v]) => `${k}=${v}`).join('\n');
+  const key = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+  const calc = crypto.createHmac('sha256', key).update(str).digest('hex');
+  res.json({
+    hasToken: !!BOT_TOKEN,
+    tokenPrefix: BOT_TOKEN ? BOT_TOKEN.slice(0, 12) + '…' : null,
+    tokenLength: BOT_TOKEN ? BOT_TOKEN.length : 0,
+    initDataLength: initData.length,
+    hashMatch: hash === calc,
+  });
+});
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
