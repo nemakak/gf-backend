@@ -980,8 +980,13 @@ function randomCode(len = 6) {
 
 async function handleStart(msg) {
   const chatId = msg.chat.id;
-  if (await isAdmin(msg.from.id)) await sendMessage(chatId, '👑 <b>Админ-панель</b>', mainAdminKeyboard());
-  else await sendMessage(chatId, '✨ <b>Style Room</b> — ИИ-примерочная в Telegram.', { inline_keyboard: [[{ text: '🛍 Открыть', web_app: { url: FRONT_URL } }]] });
+  if (await isAdmin(msg.from.id)) {
+    await sendMessage(chatId, '👑 <b>Админ-панель</b>', mainAdminKeyboard());
+  } else {
+    await sendMessage(chatId, '✨ <b>Style Room</b> — ИИ-примерочная в Telegram.', {
+      inline_keyboard: [[{ text: '🛍 Открыть', web_app: { url: FRONT_URL } }]]
+    });
+  }
 }
 
 async function handleCallback(cb) {
