@@ -669,9 +669,14 @@ app.post('/api/tryon-by-link', async (req, res) => {
     const info = await fetchWBProductInfo(wbId);
     const garmentUrl = primaryImageUrl(wbId);
     const productName = info?.name || `Товар ${wbId}`;
-    const { url: resultUrl, model } = await runFalTryon({ humanImg, garmentUrl });
+        const { url: resultUrl, model } = await runFalTryon({ humanImg, garmentUrl });
     await logGeneration(tgId, model, !!resultUrl, null);
-    if (!resultUrl) return res.json({ success: false, error: 'Не получилось.' });
+    if (!resultUrl) {
+      return res.json({
+        success: false,
+        error: 'Не удалось создать примерку. Попробуй другое фото (чёткое, в полный рост) или выбери другой товар.',
+      });
+    }
     if (!hasUnlimited) await pool.query('UPDATE users SET own_tries = own_tries - 1 WHERE tg_id = $1', [tgId]);
     await pool.query(`INSERT INTO tryon_history (user_id, product_wb_id, product_name, product_image, result_url, is_mock) VALUES ($1,$2,$3,$4,$5,$6)`, [tgId, wbId, productName, garmentUrl, resultUrl, false]);
     await giveAchievement(tgId, 'own_product');
