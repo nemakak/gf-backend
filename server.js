@@ -289,16 +289,34 @@ app.post('/api/auth', async (req, res) => {
       const upd = await pool.query(`UPDATE users SET first_name=$1, username=$2, photo_url=$3, last_active=NOW() WHERE tg_id=$4 RETURNING *`, [first_name || null, username || null, photo_url || null, tgId]);
       user = upd.rows[0];
 
-      if (streakEnabled) {
+            if (streakEnabled) {
         const lastStreak = user.last_streak_date ? new Date(user.last_streak_date).toISOString().slice(0, 10) : null;
         if (lastStreak !== today) {
           const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
           let newStreak = (lastStreak === yesterday) ? (user.streak_days || 0) + 1 : 1;
-          if (newStreak % 5 === 0) {
-            await pool.query('UPDATE users SET own_tries = own_tries + $1 WHERE tg_id = $2', [streakReward, tgId]);
-            streakBonus = streakReward;
-            sendMessage(tgId, `🔥 <b>Стрик ${newStreak} дней!</b>\n\n+${streakReward} примерки своих товаров 🎁`).catch(() => {});
+          const dayInCycle = ((newStreak - 1) % 5) + 1;
+
+          // Читаем награду из БД
+          let reward = { enabled: true, tries: 0, own_tries: 0, text: '' };
+          try {
+            const rr = await pool.query('SELECT * FROM streak_rewards WHERE day = $1', [dayInCycle]);
+            if (rr.rows.length) reward = rr.rows[0];
+          } catch {}
+
+          if (reward.enabled && (reward.tries > 0 || reward.own_tries > 0)) {
+            if (reward.tries > 0) {
+              await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [reward.tries, tgId]);
+              user.balance += reward.tries;
+            }
+            if (reward.own_tries > 0) {
+              await pool.query('UPDATE users SET own_tries = own_tries + $1 WHERE tg_id = $2', [reward.own_tries, tgId]);
+              streakBonus = reward.own_tries;
+            }
+            if (reward.tries > 0) streakBonus = reward.tries;
+            const msg = reward.text || `🔥 Серия ${newStreak} · +${reward.tries + reward.own_tries}`;
+            sendMessage(tgId, `🔥 <b>Серия ${newStreak} дней!</b>\n\n${msg}`).catch(() => {});
           }
+
           if (newStreak === 3) await giveAchievement(tgId, 'streak_3');
           if (newStreak === 5) await giveAchievement(tgId, 'streak_5');
           if (newStreak === 7) await giveAchievement(tgId, 'streak_7');
@@ -307,6 +325,9 @@ app.post('/api/auth', async (req, res) => {
         } else {
           streakDays = user.streak_days || 1;
         }
+      } else {
+        streakDays = user.streak_days || 0;
+      }
 
         const lastDaily = user.last_daily_bonus ? new Date(user.last_daily_bonus).toISOString().slice(0, 10) : null;
         if (lastDaily !== today && streakDays % 5 !== 0) {
@@ -333,7 +354,7 @@ app.post('/api/auth', async (req, res) => {
 
     res.json({
       success: true,
-      user: { ...user, streak_days: streakDays },
+            user: { ...user, streak_days: streakDays, personalized: user.personalized || false },
       daily_bonus: dailyBonus,
       streak_bonus: streakBonus,
       streak_enabled: streakEnabled,
@@ -570,6 +591,7 @@ async function runFalTryon({ humanImg, garmentUrl }) {
     const m = cleanGarmentUrl.match(/^(.*\/images\/[a-z0-9]+)(\/(\d+\.[a-z]+))?$/i);
     if (m && !m[3]) cleanGarmentUrl = `${m[1]}/1.webp`;
   }
+
   let garmentData = cleanGarmentUrl;
   if (cleanGarmentUrl && cleanGarmentUrl.startsWith('http') && !cleanGarmentUrl.startsWith('data:')) {
     const b64 = await fetchImageAsBase64(cleanGarmentUrl);
@@ -586,13 +608,25 @@ async function runFalTryon({ humanImg, garmentUrl }) {
       }
     }
   }
+
   const controller = new AbortController();
   try {
     const url = await withTimeout(
-      fal.subscribe('fal-ai/image-apps-v2/virtual-try-on', { input: { person_image_url: humanImg, clothing_image_url: garmentData }, logs: false, abortSignal: controller.signal }).then(r => r?.data?.image?.url || r?.data?.images?.[0]?.url || null),
-      30000, 'image-apps-v2', controller);
+      fal.subscribe('fal-ai/image-apps-v2/virtual-try-on', {
+        input: {
+          person_image_url: humanImg,
+          clothing_image_url: garmentData,
+          prompt: 'Same person, same pose, same face, same body, same hair, same skin tone, same background, same lighting. Only change the clothing to match the garment.',
+          negative_prompt: 'different face, different person, changed pose, changed body, different background, different lighting, deformed face',
+        },
+        logs: false,
+        abortSignal: controller.signal,
+      }).then(r => r?.data?.image?.url || r?.data?.images?.[0]?.url || null),
+      45000, 'image-apps-v2', controller
+    );
     if (url) return { url, model: 'image-apps-v2' };
   } catch (e) { logFalError('image-apps-v2', e); }
+
   return { url: null, model: null };
 }
 
@@ -1704,7 +1738,183 @@ app.get('/api/catalog-personal', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+// ============================================================
+// СЕРИЯ — награды по дням (админ + клиент)
+// ============================================================
+app.get('/api/streak-rewards', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT day, enabled, tries, own_tries, text FROM streak_rewards ORDER BY day ASC');
+    res.json({ success: true, rewards: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
+app.post('/api/admin/streak-rewards/update', async (req, res) => {
+  const { initData, day, enabled, tries, own_tries, text } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  if (![1,2,3,4,5].includes(Number(day))) return res.status(400).json({ error: 'day 1-5' });
+  try {
+    await pool.query(
+      `INSERT INTO streak_rewards (day, enabled, tries, own_tries, text, updated_at)
+       VALUES ($1,$2,$3,$4,$5,NOW())
+       ON CONFLICT (day) DO UPDATE SET
+         enabled=EXCLUDED.enabled,
+         tries=EXCLUDED.tries,
+         own_tries=EXCLUDED.own_tries,
+         text=EXCLUDED.text,
+         updated_at=NOW()`,
+      [Number(day), !!enabled, Number(tries) || 0, Number(own_tries) || 0, String(text || '').slice(0, 100)]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    logError('streak-rewards-update', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
+// БАННЕР ПОДПИСКИ (админ + клиент)
+// ============================================================
+app.get('/api/banner', async (_req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM banners WHERE enabled = TRUE ORDER BY id DESC LIMIT 1');
+    if (!r.rows.length) return res.json({ success: true, banner: null });
+    res.json({ success: true, banner: r.rows[0] });
+  } catch (e) { res.json({ success: true, banner: null }); }
+});
+
+app.post('/api/admin/banner/update', async (req, res) => {
+  const { initData, title, subtitle, sub_id, bg_from, bg_to, emoji, enabled } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const existing = await pool.query('SELECT id FROM banners ORDER BY id ASC LIMIT 1');
+    if (existing.rows.length) {
+      await pool.query(
+        `UPDATE banners SET title=$1, subtitle=$2, sub_id=$3, bg_from=$4, bg_to=$5, emoji=$6, enabled=$7, updated_at=NOW() WHERE id=$8`,
+        [
+          String(title || 'Ограниченное предложение').slice(0, 100),
+          String(subtitle || '').slice(0, 100),
+          String(sub_id || 'secret').slice(0, 50),
+          String(bg_from || '#E91E63').slice(0, 20),
+          String(bg_to || '#880E4F').slice(0, 20),
+          String(emoji || '🎁').slice(0, 10),
+          !!enabled,
+          existing.rows[0].id,
+        ]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO banners (title, subtitle, sub_id, bg_from, bg_to, emoji, enabled) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [title, subtitle, sub_id, bg_from, bg_to, emoji, !!enabled]
+      );
+    }
+    res.json({ success: true });
+  } catch (e) {
+    logError('banner-update', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
+// МАССОВОЕ УДАЛЕНИЕ ТОВАРОВ
+// ============================================================
+app.post('/api/admin/products/bulk-action', async (req, res) => {
+  const { initData, ids, action } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'ids обязателен' });
+  if (!['delete', 'hide', 'unhide'].includes(action)) return res.status(400).json({ error: 'action' });
+
+  try {
+    let sql;
+    if (action === 'delete') sql = `DELETE FROM products WHERE id = ANY($1)`;
+    else if (action === 'hide') sql = `UPDATE products SET is_active = FALSE WHERE id = ANY($1)`;
+    else sql = `UPDATE products SET is_active = TRUE WHERE id = ANY($1)`;
+    const r = await pool.query(sql, [ids]);
+    res.json({ success: true, affected: r.rowCount });
+  } catch (e) {
+    logError('bulk-action', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Удалить все СКРЫТЫЕ в категории
+app.post('/api/admin/products/clear-hidden', async (req, res) => {
+  const { initData, category } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    let sql = 'DELETE FROM products WHERE is_active = FALSE';
+    const params = [];
+    if (category && category !== 'all') {
+      sql += ' AND category = $1';
+      params.push(category);
+    }
+    const r = await pool.query(sql, params);
+    res.json({ success: true, affected: r.rowCount });
+  } catch (e) {
+    logError('clear-hidden', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
+// ВЫДАТЬ — список юзеров для админки
+// ============================================================
+app.post('/api/admin/users-list', async (req, res) => {
+  const { initData, query, limit = 50 } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const lim = Math.min(200, Number(limit) || 50);
+    const params = [];
+    let where = 'WHERE 1=1';
+    if (query && String(query).trim()) {
+      const q = `%${String(query).trim().toLowerCase()}%`;
+      params.push(q);
+      where += ` AND (LOWER(COALESCE(first_name,'')) LIKE $${params.length} OR LOWER(COALESCE(username,'')) LIKE $${params.length} OR CAST(tg_id AS TEXT) LIKE $${params.length})`;
+    }
+    params.push(lim);
+    const sql = `
+      SELECT tg_id, first_name, username, photo_url, balance, own_tries, is_admin, is_banned,
+        (SELECT COUNT(*)::int FROM tryon_history WHERE user_id = users.tg_id) AS tryons,
+        (SELECT COALESCE(SUM(stars),0)::int FROM payments WHERE tg_id = users.tg_id) AS stars_paid
+      FROM users ${where}
+      ORDER BY last_active DESC NULLS LAST
+      LIMIT $${params.length}
+    `;
+    const r = await pool.query(sql, params);
+    res.json({ success: true, users: r.rows });
+  } catch (e) {
+    logError('users-list', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
+// СОХРАНИТЬ ПЕРСОНАЛИЗАЦИЮ
+// ============================================================
+app.post('/api/save-personalization', async (req, res) => {
+  const { initData, answers } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    await pool.query(
+      `UPDATE users SET personalization = $1, personalized = TRUE WHERE tg_id = $2`,
+      [JSON.stringify(answers || {}), tgUser.id]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    logError('save-personalization', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 const PORT = process.env.PORT || 3000;
 app.post('/debug-auth', (req, res) => {
   const initData = (req.body && req.body.initData) || '';
