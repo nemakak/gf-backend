@@ -319,12 +319,13 @@ app.post('/api/auth', async (req, res) => {
           if (newStreak === 3) await giveAchievement(tgId, 'streak_3');
           if (newStreak === 5) await giveAchievement(tgId, 'streak_5');
           if (newStreak === 7) await giveAchievement(tgId, 'streak_7');
-          await pool.query('UPDATE users SET streak_days=$1, last_streak_date=CURRENT_DATE WHERE tg_id=$2', [newStreak, tgId]);
+                    await pool.query('UPDATE users SET streak_days=$1, last_streak_date=CURRENT_DATE WHERE tg_id=$2', [newStreak, tgId]);
           streakDays = newStreak;
         } else {
           streakDays = user.streak_days || 1;
         }
-             const lastDaily = user.last_daily_bonus ? new Date(user.last_daily_bonus).toISOString().slice(0, 10) : null;
+
+        const lastDaily = user.last_daily_bonus ? new Date(user.last_daily_bonus).toISOString().slice(0, 10) : null;
         if (lastDaily !== today && streakDays % 5 !== 0) {
           await pool.query('UPDATE users SET balance = balance + $1, last_daily_bonus = CURRENT_DATE WHERE tg_id = $2', [dailyBonusTries, tgId]);
           dailyBonus = dailyBonusTries;
@@ -332,7 +333,9 @@ app.post('/api/auth', async (req, res) => {
         } else if (lastDaily !== today) {
           await pool.query('UPDATE users SET last_daily_bonus = CURRENT_DATE WHERE tg_id = $1', [tgId]);
         }
-    }
+      } else {
+        streakDays = user.streak_days || 0;
+      }
 
     let oneTimeMsg = null;
     const otm = await getSetting('one_time_message', '');
