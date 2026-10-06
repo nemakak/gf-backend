@@ -5,6 +5,9 @@ import { pool } from './db.js';
 const TOP_N = 30;
 const CLOUDFLARE_PROXY = 'https://gf-images.maxgamingbrawlstars.workers.dev';
 
+// ============================================================
+// ЗАПРОСЫ ПО КАТЕГОРИЯМ
+// ============================================================
 const QUERIES_BY_CAT = {
   autumn: [
     'женские осенние пальто',
@@ -13,6 +16,10 @@ const QUERIES_BY_CAT = {
     'женские осенние плащи',
     'женские пальто женские',
     'женские осенние куртки женские',
+    'женские пуховики осенние',
+    'женские бомберы',
+    'женские жилеты осенние',
+    'женские дубленки',
   ],
   top: [
     'женские свитеры',
@@ -22,12 +29,18 @@ const QUERIES_BY_CAT = {
     'женские блузки',
     'женские кардиганы',
     'женские рубашки',
+    'женские лонгсливы',
+    'женские свитшоты',
+    'женские боди',
   ],
   bottom: [
     'женские джинсы',
     'женские брюки',
     'женские шорты',
     'женские леггинсы',
+    'женские брюки палаццо',
+    'женские джинсы baggy',
+    'женские юбки',
   ],
   outerwear: [
     'женские куртки',
@@ -39,17 +52,29 @@ const QUERIES_BY_CAT = {
     'женские костюмы',
     'женские комплекты',
     'женские костюмы двойки',
+    'женские спортивные костюмы',
   ],
   dress: [
     'женские платья',
     'женские сарафаны',
     'женские юбки',
     'женские платья вечерние',
+    'женские платья миди',
+    'женские платья мини',
   ],
 };
 
+// ============================================================
+// ФИЛЬТРЫ
+// ============================================================
 const MALE_WORDS = /\b(мужск|мужчин|для мужчин|male|boy|men)\b/i;
 
+// Расширенный BLOCK — исключаем обувь, бельё, косметику, детское и т.д.
+const BLOCK = /(ботинк|сапог|туфл|кроссовк|балетк|шлепан|тапочк|сандал|босоножк|лофер|мокасин|кеды|слипоны|халат|ночнушк|пижам|пеньюар|термобелье|термошорт|термоштаны|панталон|гольфы|пояс|ремень|ремн|кошел|рюкзак|клатч|косметик|парфюм|крем|маск|сыворотк|помад|тушь|пудр|игрушк|подушк|полотенц|постель|детск|школьн|беременн|больших размеров|для полных|пляжн|купальник|плавки|бель[её]|бельев|трус|трусик|бюст|бра\b|лифчик|чашк|носк|колготк|чулк|комплект\s*белья|нижнее\s*белье|боди[а]?рт|стринг|танга|слип\b|боксер|семейн|пижамк)/i;
+
+// ============================================================
+// ХЕЛПЕРЫ
+// ============================================================
 function basketFor(id) {
   const vol = Math.floor(id / 100000);
   if (vol <= 143) return '01'; if (vol <= 287) return '02'; if (vol <= 431) return '03';
@@ -59,9 +84,17 @@ function basketFor(id) {
   if (vol <= 2045) return '13'; if (vol <= 2189) return '14'; if (vol <= 2405) return '15';
   if (vol <= 2621) return '16'; if (vol <= 2837) return '17'; return '18';
 }
-function imageUrl(id) { return `https://spb-basket-cdn-03.geobasket.ru/vol${Math.floor(id/100000)}/part${Math.floor(id/1000)}/${id}/images/hq/1.webp`; }
-function fallbackUrl(id) { return `https://basket-${basketFor(id)}.wbbasket.ru/vol${Math.floor(id/100000)}/part${Math.floor(id/1000)}/${id}/images/big/1.webp`; }
-function formatPrice(p) { return p ? `${Math.round(p / 100).toLocaleString('ru-RU')} ₽` : null; }
+
+function imageUrl(id) {
+  return `https://spb-basket-cdn-03.geobasket.ru/vol${Math.floor(id/100000)}/part${Math.floor(id/1000)}/${id}/images/hq/1.webp`;
+}
+function fallbackUrl(id) {
+  return `https://basket-${basketFor(id)}.wbbasket.ru/vol${Math.floor(id/100000)}/part${Math.floor(id/1000)}/${id}/images/big/1.webp`;
+}
+
+function formatPrice(p) {
+  return p ? `${Math.round(p / 100).toLocaleString('ru-RU')} ₽` : null;
+}
 
 function shortenName(name) {
   if (!name) return 'Товар';
@@ -100,6 +133,9 @@ function headers() {
   };
 }
 
+// ============================================================
+// ЗАПРОС К WB ЧЕРЕЗ НЕСКОЛЬКО ENDPOINT'ОВ
+// ============================================================
 async function tryFetch(url) {
   try {
     const r = await fetch(url, { headers: headers(), timeout: 12000 });
@@ -141,6 +177,9 @@ async function fetchSearch(query) {
   throw new Error('Все endpoints WB вернули пустоту (403 или отключены)');
 }
 
+// ============================================================
+// ГЛАВНАЯ ФУНКЦИЯ
+// ============================================================
 export async function refreshCatalog(categoryFilter = 'all') {
   const t0 = Date.now();
   console.log(`[wb] старт (category=${categoryFilter})…`);
@@ -170,7 +209,11 @@ export async function refreshCatalog(categoryFilter = 'all') {
         const id = Number(p.id);
         if (!id) continue;
         const name = p.name || 'Товар';
+
+        // Фильтр 1: мужское
         if (MALE_WORDS.test(name)) { totalSkipped++; continue; }
+        // Фильтр 2: бельё, обувь, косметика, детское и т.д.
+        if (BLOCK.test(name)) { totalSkipped++; continue; }
 
         try {
           const price = formatPrice(p.salePriceU ?? p.priceU);
