@@ -120,6 +120,25 @@ function verifyTelegramInitData(initData) {
     return ok ? JSON.parse(p.get('user')) : null;
   } catch { return null; }
 }
+app.post('/debug-auth', (req, res) => {
+  const initData = req.body.initData || '';
+  const p = new URLSearchParams(initData);
+  const hash = p.get('hash') || '';
+  p.delete('hash');
+  const str = [...p.entries()].sort().map(([k, v]) => `${k}=${v}`).join('\n');
+  const key = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+  const calc = crypto.createHmac('sha256', key).update(str).digest('hex');
+  res.json({
+    hasToken: !!BOT_TOKEN,
+    tokenPrefix: BOT_TOKEN ? BOT_TOKEN.slice(0, 12) + '…' : null,
+    tokenLength: BOT_TOKEN ? BOT_TOKEN.length : 0,
+    initDataLength: initData.length,
+    hashFromTelegram: hash.slice(0, 12) + '…',
+    hashCalculated: calc.slice(0, 12) + '…',
+    match: hash === calc,
+    userName: (() => { try { return JSON.parse(p.get('user') || '{}').username; } catch { return null; } })(),
+  });
+});
 async function tgApi(method, payload) {
   const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
   return r.json();
