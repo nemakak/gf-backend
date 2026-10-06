@@ -15,6 +15,7 @@ app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const FRONT_URL = process.env.FRONT_URL || 'https://gf-front.vercel.app';
+const BOT_HANDLE = '@GFstyleroom_bot';
 const BOT_NAME = 'GFstyleroom_bot';
 fal.config({ credentials: process.env.FAL_KEY });
 
