@@ -286,10 +286,12 @@ app.post('/api/auth', async (req, res) => {
     } else {
       user = existing.rows[0];
       if (user.is_banned) return res.status(403).json({ error: 'Banned', reason: user.ban_reason || 'Нарушение правил' });
-      const upd = await pool.query(`UPDATE users SET first_name=$1, username=$2, photo_url=$3, last_active=NOW() WHERE tg_id=$4 RETURNING *`, [first_name || null, username || null, photo_url || null, tgId]);
+      const upd = await pool.query(
+        `UPDATE users SET first_name=$1, username=$2, photo_url=$3, last_active=NOW() WHERE tg_id=$4 RETURNING *`,
+        [first_name || null, username || null, photo_url || null, tgId]);
       user = upd.rows[0];
 
-               if (streakEnabled) {
+      if (streakEnabled) {
         const lastStreak = user.last_streak_date ? new Date(user.last_streak_date).toISOString().slice(0, 10) : null;
         if (lastStreak !== today) {
           const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
@@ -319,7 +321,7 @@ app.post('/api/auth', async (req, res) => {
           if (newStreak === 3) await giveAchievement(tgId, 'streak_3');
           if (newStreak === 5) await giveAchievement(tgId, 'streak_5');
           if (newStreak === 7) await giveAchievement(tgId, 'streak_7');
-                    await pool.query('UPDATE users SET streak_days=$1, last_streak_date=CURRENT_DATE WHERE tg_id=$2', [newStreak, tgId]);
+          await pool.query('UPDATE users SET streak_days=$1, last_streak_date=CURRENT_DATE WHERE tg_id=$2', [newStreak, tgId]);
           streakDays = newStreak;
         } else {
           streakDays = user.streak_days || 1;
@@ -336,6 +338,7 @@ app.post('/api/auth', async (req, res) => {
       } else {
         streakDays = user.streak_days || 0;
       }
+    }
 
     let oneTimeMsg = null;
     const otm = await getSetting('one_time_message', '');
@@ -349,80 +352,16 @@ app.post('/api/auth', async (req, res) => {
 
     res.json({
       success: true,
-            user: { ...user, streak_days: streakDays, personalized: user.personalized || false },
+      user: { ...user, streak_days: streakDays, personalized: user.personalized || false },
       daily_bonus: dailyBonus,
       streak_bonus: streakBonus,
       streak_enabled: streakEnabled,
       one_time_message: oneTimeMsg,
     });
-  } catch (e) { logError('auth', e.message); res.status(500).json({ error: 'Server error' }); }
-});
-
-// ============================================================
-// ADMIN: пополнение каталога и добавление товаров по ссылкам
-// ============================================================
-
-// 1) Пополнение каталога из WB
-app.post('/api/admin/refresh-catalog', async (req, res) => {
-  const { initData, category } = req.body;
-  const tgUser = verifyTelegramInitData(initData);
-  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
-  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
-  try {
-    const cat = category || 'all';
-    // 'all' — тянет все категории, включая Осень, параллельно
-    const result = await refreshCatalog(cat);
-    res.json(result);
   } catch (e) {
-    logError('admin-refresh', e.message);
-    res.status(500).json({ success: false, reason: e.message, error: e.message });
+    logError('auth', e.message);
+    res.status(500).json({ error: 'Server error' });
   }
-});
-
-// 2) Добавление товаров по ссылкам WB (свои товары)
-app.post('/api/admin/add-links', async (req, res) => {
-  const { initData, links } = req.body;
-  const tgUser = verifyTelegramInitData(initData);
-  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
-  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
-  if (!links || !String(links).trim()) return res.status(400).json({ error: 'Пусто' });
-
-  const ids = extractWbIds(String(links));
-  if (!ids.length) return res.status(400).json({ error: 'Не нашёл артикулы WB' });
-
-  const results = [];
-  for (let i = 0; i < ids.length; i += 5) {
-    const chunk = ids.slice(i, i + 5);
-    const chunkRes = await Promise.all(chunk.map(async (wbId) => {
-      try {
-        const info = await fetchWBProductInfo(wbId);
-        const name = info?.name || `Товар ${wbId}`;
-        const price = info?.price || null;
-        const category = guessCategory(name);
-        const img = primaryImageUrl(wbId);
-        const fb = fallbackImageUrl(wbId);
-        const srcUrl = `https://www.wildberries.ru/catalog/${wbId}/detail.aspx`;
-
-        await pool.query(
-          `INSERT INTO products (wb_id, name, price, category, image_url, fallback_url, is_active, source, description, source_url, updated_at, created_at)
-           VALUES ($1,$2,$3,$4,$5,$6,TRUE,'manual',$7,$8,NOW(),NOW())
-           ON CONFLICT (wb_id) DO UPDATE SET
-             name=EXCLUDED.name, price=EXCLUDED.price, category=EXCLUDED.category,
-             image_url=EXCLUDED.image_url, fallback_url=EXCLUDED.fallback_url,
-             is_active=TRUE, description=EXCLUDED.description, source_url=EXCLUDED.source_url,
-             updated_at=NOW()`,
-          [wbId, name, price, category, img, fb, info?.description || name, srcUrl]
-        );
-        return { wbId, ok: true, name, price, category };
-      } catch (e) {
-        return { wbId, ok: false, error: e.message };
-      }
-    }));
-    results.push(...chunkRes);
-  }
-
-  const ok = results.filter(r => r.ok);
-  res.json({ success: true, added: ok.length, failed: results.length - ok.length, items: ok });
 });
 
 app.get('/api/settings', async (_req, res) => {
