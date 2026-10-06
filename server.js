@@ -519,6 +519,73 @@ async function fetchImageAsBase64(url) {
   } catch { return null; }
 }
 
+// ============================================================
+// ОБРЕЗКА КАРТИНКИ ТОВАРА ПО КАТЕГОРИИ
+// ============================================================
+// Возвращает data URL обрезанной картинки (jpeg)
+async function cropGarmentByCategory(imageUrl, category) {
+  // Платья и костюмы — не обрезаем
+  if (category === 'dress' || category === 'suit') {
+    return await fetchImageAsBase64(imageUrl);
+  }
+
+  // Настройки обрезки для каждой категории
+  // start — с какого % сверху начинать
+  // end — до какого % снизу заканчивать
+  const CROPS = {
+    bottom:    { start: 0.30, end: 1.00 },  // убираем голову и грудь сверху
+    top:       { start: 0.00, end: 0.55 },  // убираем ноги снизу
+    outerwear: { start: 0.00, end: 0.55 },  // убираем ноги снизу
+    autumn:    { start: 0.00, end: 0.55 },  // убираем ноги снизу
+  };
+
+  const crop = CROPS[category];
+  if (!crop) {
+    return await fetchImageAsBase64(imageUrl);
+  }
+
+  try {
+    // 1. Скачиваем оригинальную картинку
+    const r = await fetch(imageUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0',
+        'Referer': 'https://www.wildberries.ru/',
+        'Accept': 'image/*,*/*;q=0.8',
+      },
+      timeout: 12000,
+    });
+    if (!r.ok) return null;
+    const buffer = await r.buffer();
+
+    // 2. Обрезаем через sharp
+    let sharp;
+    try { sharp = (await import('sharp')).default; } catch { return null; }
+
+    const image = sharp(buffer);
+    const meta = await image.metadata();
+    const w = meta.width;
+    const h = meta.height;
+
+    if (!w || !h) return null;
+
+    const top = Math.round(h * crop.start);
+    const bottom = Math.round(h * crop.end);
+    const height = bottom - top;
+
+    if (height < 100) return null; // защита от слишком маленьких
+
+    const cropped = await image
+      .extract({ left: 0, top, width: w, height })
+      .jpeg({ quality: 85 })
+      .toBuffer();
+
+    return `data:image/jpeg;base64,${cropped.toString('base64')}`;
+  } catch (e) {
+    console.error('[crop-garment]', e.message);
+    return null;
+  }
+}
+
 async function runFalTryon({ humanImg, garmentUrl }) {
   let cleanGarmentUrl = garmentUrl;
   if (typeof cleanGarmentUrl === 'string') {
