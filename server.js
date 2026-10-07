@@ -307,7 +307,7 @@ app.post('/api/auth', async (req, res) => {
     const streakEnabled = await isStreakEnabled();
 
     const existing = await pool.query('SELECT * FROM users WHERE tg_id = $1', [tgId]);
-    let user, dailyBonus = 0, streakBonus = 0, streakDays = 0;
+    let user, dailyBonus = 0, streakBonus = 0, streakDays = 0, streakSecondsToday = 0;
     const today = new Date().toISOString().slice(0, 10);
 
     if (existing.rows.length === 0) {
@@ -335,42 +335,30 @@ app.post('/api/auth', async (req, res) => {
         [first_name || null, username || null, photo_url || null, tgId]);
       user = upd.rows[0];
 
-      if (streakEnabled) {
-        const lastStreak = user.last_streak_date ? new Date(user.last_streak_date).toISOString().slice(0, 10) : null;
-        if (lastStreak !== today) {
-          const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-          let newStreak = (lastStreak === yesterday) ? (user.streak_days || 0) + 1 : 1;
-          const dayInCycle = ((newStreak - 1) % 5) + 1;
-
-          let reward = { enabled: true, tries: 0, own_tries: 0, text: '' };
-          try {
-            const rr = await pool.query('SELECT * FROM streak_rewards WHERE day = $1', [dayInCycle]);
-            if (rr.rows.length) reward = rr.rows[0];
-          } catch {}
-
-          if (reward.enabled && (reward.tries > 0 || reward.own_tries > 0)) {
-            if (reward.tries > 0) {
-              await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [reward.tries, tgId]);
-              user.balance += reward.tries;
-            }
-            if (reward.own_tries > 0) {
-              await pool.query('UPDATE users SET own_tries = own_tries + $1 WHERE tg_id = $2', [reward.own_tries, tgId]);
-              streakBonus = reward.own_tries;
-            }
-            if (reward.tries > 0) streakBonus = reward.tries;
-            const msg = reward.text || `🔥 Серия ${newStreak} · +${reward.tries + reward.own_tries}`;
-            sendMessage(tgId, `🔥 <b>Серия ${newStreak} дней!</b>\n\n${msg}`).catch(() => {});
-          }
-
-          if (newStreak === 3) await giveAchievement(tgId, 'streak_3');
-          if (newStreak === 5) await giveAchievement(tgId, 'streak_5');
-          if (newStreak === 7) await giveAchievement(tgId, 'streak_7');
-          await pool.query('UPDATE users SET streak_days=$1, last_streak_date=CURRENT_DATE WHERE tg_id=$2', [newStreak, tgId]);
-          streakDays = newStreak;
+            if (streakEnabled) {
+        // Если день новый — сбрасываем таймер
+        const lastTimerDate = user.streak_timer_date ? new Date(user.streak_timer_date).toISOString().slice(0, 10) : null;
+        let secondsToday = 0;
+        if (lastTimerDate !== today) {
+          secondsToday = 0;
+          await pool.query('UPDATE users SET streak_seconds_today = 0, streak_timer_date = CURRENT_DATE WHERE tg_id = $1', [tgId]);
         } else {
-          streakDays = user.streak_days || 1;
+          secondsToday = user.streak_seconds_today || 0;
         }
 
+        // Проверяем — пропустил ли вчерашний день (сгорание серии)
+        const lastCounted = user.streak_last_counted ? new Date(user.streak_last_counted).toISOString().slice(0, 10) : null;
+        const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+
+        if (lastCounted && lastCounted !== today && lastCounted !== yesterday) {
+          await pool.query('UPDATE users SET streak_days = 0 WHERE tg_id = $1', [tgId]);
+          user.streak_days = 0;
+        }
+
+        streakDays = user.streak_days || 0;
+        streakSecondsToday = secondsToday;
+
+        // Ежедневный бонус
         const lastDaily = user.last_daily_bonus ? new Date(user.last_daily_bonus).toISOString().slice(0, 10) : null;
         if (lastDaily !== today && streakDays % 5 !== 0) {
           await pool.query('UPDATE users SET balance = balance + $1, last_daily_bonus = CURRENT_DATE WHERE tg_id = $2', [dailyBonusTries, tgId]);
@@ -395,13 +383,14 @@ app.post('/api/auth', async (req, res) => {
     }
 
     res.json({
-      success: true,
-      user: { ...user, streak_days: streakDays, personalized: user.personalized || false },
-      daily_bonus: dailyBonus,
-      streak_bonus: streakBonus,
-      streak_enabled: streakEnabled,
-      one_time_message: oneTimeMsg,
-    });
+  success: true,
+  user: { ...user, streak_days: streakDays, personalized: user.personalized || false },
+  daily_bonus: dailyBonus,
+  streak_bonus: streakBonus,
+  streak_enabled: streakEnabled,
+  streak_seconds_today: streakSecondsToday,
+  one_time_message: oneTimeMsg,
+});
   } catch (e) {
     logError('auth', e.message);
     res.status(500).json({ error: 'Server error' });
