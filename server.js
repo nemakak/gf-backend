@@ -85,22 +85,66 @@ const ACHIEVEMENTS = {
   } catch (e) { console.error('[init]', e.message); }
 })();
 
-async function logError(source, message, detail = null) {
-  console.error(`[ERROR][${source}] ${message}`, detail || '');
+async function logError(source, message, detail = null, ctx = null) {
+  console.error(`[ERROR][${source}] ${message}`, detail || '', ctx ? JSON.stringify(ctx) : '');
   try {
-    await pool.query(`INSERT INTO error_log (source, message, detail) VALUES ($1,$2,$3)`, [source, String(message || '').slice(0, 500), detail ? String(detail).slice(0, 2000) : null]);
+    await pool.query(
+      `INSERT INTO error_log (source, message, detail) VALUES ($1,$2,$3)`,
+      [source, String(message || '').slice(0, 500), detail ? String(detail).slice(0, 2000) : null]
+    );
     const important = ['tryon', 'wb', 'refresh-catalog', 'auth', 'cleanup'];
     if (important.some(k => source.startsWith(k))) {
       const admins = await pool.query('SELECT tg_id FROM users WHERE is_admin = TRUE');
-      const text = `⚠️ <b>Ошибка</b>\n\n<code>${source}</code>\n${String(message || '').slice(0, 200)}`;
+      
+      // Формируем контекст юзера
+      let userBlock = '';
+      if (ctx && (ctx.tg_id || ctx.username || ctx.first_name)) {
+        const name = ctx.first_name || '—';
+        const uname = ctx.username ? `@${ctx.username}` : '—';
+        const uid = ctx.tg_id || '—';
+        userBlock = `\n\n👤 <b>Кто:</b> ${name} · ${uname}\n🆔 <code>${uid}</code>`;
+      }
+      if (ctx && ctx.action) {
+        userBlock += `\n🎯 <b>Действие:</b> ${ctx.action}`;
+      }
+      if (ctx && ctx.item_id) {
+        userBlock += `\n📦 Товар ID: <code>${ctx.item_id}</code>`;
+      }
+      
+      const text = `⚠️ <b>Ошибка</b>\n\n<code>${source}</code>\n${String(message || '').slice(0, 200)}${userBlock}`;
+      
       for (const a of admins.rows) {
+        const keyboard = ctx && ctx.tg_id ? {
+          inline_keyboard: [[
+            { text: '💬 Написать юзеру', url: `tg://user?id=${ctx.tg_id}` }
+          ]]
+        } : null;
+        
         fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: a.tg_id, text, parse_mode: 'HTML' }),
+          body: JSON.stringify({ 
+            chat_id: a.tg_id, 
+            text, 
+            parse_mode: 'HTML',
+            ...(keyboard ? { reply_markup: keyboard } : {}),
+          }),
         }).catch(() => {});
       }
     }
   } catch {}
+}
+
+// Хелпер — распарсить юзера из initData или из req.body
+function extractUserContext(initData) {
+  try {
+    const tgUser = verifyTelegramInitData(initData || '');
+    if (!tgUser) return null;
+    return {
+      tg_id: tgUser.id,
+      username: tgUser.username || null,
+      first_name: tgUser.first_name || null,
+    };
+  } catch { return null; }
 }
 
 async function logGeneration(tgId, model, success, itemId = null) {
@@ -976,8 +1020,15 @@ app.post('/api/tryon', async (req, res) => {
       if (refCnt.rows[0].c >= 3) await giveAchievement(user.ref_by, 'three_refs');
     }
     res.json({ success: true, resultUrl, model });
-  } catch (e) { logError('tryon', e.message); res.json({ success: false, error: 'Что-то пошло не так.' }); }
-});
+    } catch (e) {
+    const uctx = extractUserContext(initData);
+    logError('tryon', e.message, null, {
+      ...(uctx || {}),
+      action: 'Примерка товара',
+      item_id: itemId,
+    });
+    res.json({ success: false, error: 'Что-то пошло не так.' });
+  }
 
 app.post('/api/tryon-by-link', async (req, res) => {
   const { initData, humanImg, wbLink } = req.body;
