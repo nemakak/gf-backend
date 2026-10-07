@@ -364,6 +364,150 @@ app.post('/api/auth', async (req, res) => {
   }
 });
 
+// ============================================================
+// ПОДПИСКИ — публичный API (для клиента)
+// ============================================================
+app.get('/api/subscriptions', async (_req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, name, subtitle, emoji, price, price_old, tries, own_tries,
+              duration_days, features, accent, image_url, bg_from, bg_to, sort_order
+       FROM subscriptions
+       WHERE enabled = TRUE
+       ORDER BY sort_order ASC, price ASC`
+    );
+    res.json({ success: true, items: r.rows });
+  } catch (e) {
+    logError('subscriptions-list', e.message);
+    res.json({ success: true, items: [] });
+  }
+});
+
+// ============================================================
+// ПОДПИСКИ — админский API (CRUD)
+// ============================================================
+
+// Получить ВСЕ подписки (включая выключенные) — для админки
+app.post('/api/admin/subscriptions/list', async (req, res) => {
+  const { initData } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const r = await pool.query(
+      `SELECT id, name, subtitle, emoji, price, price_old, tries, own_tries,
+              duration_days, features, accent, image_url, bg_from, bg_to, sort_order, enabled
+       FROM subscriptions
+       ORDER BY sort_order ASC, price ASC`
+    );
+    res.json({ success: true, items: r.rows });
+  } catch (e) {
+    logError('admin-subscriptions-list', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Создать или обновить подписку
+app.post('/api/admin/subscriptions/update', async (req, res) => {
+  const { initData, sub } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  if (!sub || !sub.id || !sub.name) return res.status(400).json({ error: 'id и name обязательны' });
+  if (!Number.isFinite(sub.price) || sub.price < 0) return res.status(400).json({ error: 'Некорректная цена' });
+
+  try {
+    await pool.query(
+      `INSERT INTO subscriptions (id, name, subtitle, emoji, price, price_old, tries, own_tries, duration_days, features, accent, image_url, bg_from, bg_to, sort_order, enabled, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         name = EXCLUDED.name,
+         subtitle = EXCLUDED.subtitle,
+         emoji = EXCLUDED.emoji,
+         price = EXCLUDED.price,
+         price_old = EXCLUDED.price_old,
+         tries = EXCLUDED.tries,
+         own_tries = EXCLUDED.own_tries,
+         duration_days = EXCLUDED.duration_days,
+         features = EXCLUDED.features,
+         accent = EXCLUDED.accent,
+         image_url = EXCLUDED.image_url,
+         bg_from = EXCLUDED.bg_from,
+         bg_to = EXCLUDED.bg_to,
+         sort_order = EXCLUDED.sort_order,
+         enabled = EXCLUDED.enabled,
+         updated_at = NOW()`,
+      [
+        String(sub.id).slice(0, 30),
+        String(sub.name).slice(0, 50),
+        String(sub.subtitle || '').slice(0, 100),
+        String(sub.emoji || '💎').slice(0, 10),
+        Number(sub.price) || 0,
+        Number(sub.price_old) || 0,
+        Number(sub.tries) || 0,
+        Number(sub.own_tries) || 0,
+        Number(sub.duration_days) || 30,
+        JSON.stringify(Array.isArray(sub.features) ? sub.features : []),
+        String(sub.accent || '#D4B595').slice(0, 20),
+        String(sub.image_url || '').slice(0, 500),
+        String(sub.bg_from || '#1A1412').slice(0, 20),
+        String(sub.bg_to || '#2A1F1A').slice(0, 20),
+        Number(sub.sort_order) || 0,
+        sub.enabled !== false,
+      ]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    logError('admin-subscriptions-update', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Удалить подписку
+app.post('/api/admin/subscriptions/delete', async (req, res) => {
+  const { initData, id } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  if (!id) return res.status(400).json({ error: 'id обязателен' });
+  try {
+    const active = await pool.query(
+      'SELECT COUNT(*)::int AS c FROM users WHERE sub_id = $1 AND sub_expires_at > NOW()',
+      [id]
+    );
+    if (active.rows[0].c > 0) {
+      return res.status(400).json({
+        error: `Нельзя удалить: ${active.rows[0].c} юзеров на этой подписке. Сначала снимите с них.`
+      });
+    }
+    await pool.query('DELETE FROM subscriptions WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (e) {
+    logError('admin-subscriptions-delete', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Сменить порядок (вверх/вниз)
+app.post('/api/admin/subscriptions/reorder', async (req, res) => {
+  const { initData, orders } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  if (!Array.isArray(orders)) return res.status(400).json({ error: 'orders обязателен' });
+  try {
+    for (const o of orders) {
+      if (o && o.id && Number.isFinite(o.sort_order)) {
+        await pool.query('UPDATE subscriptions SET sort_order = $1 WHERE id = $2', [Number(o.sort_order), o.id]);
+      }
+    }
+    res.json({ success: true });
+  } catch (e) {
+    logError('admin-subscriptions-reorder', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/settings', async (_req, res) => {
   try {
     const maintenance = await isMaintenanceMode();
