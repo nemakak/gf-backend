@@ -1167,12 +1167,18 @@ app.post('/api/onboarded', async (req, res) => {
 app.post('/api/create-invoice', async (req, res) => {
   const { tgId, productType, tries, ownTries } = req.body;
   let title = '10 примерок', amount = 50, payload = `pack10:${tgId}:${Date.now()}`;
-  if (SUBSCRIPTIONS[productType]) {
-    const sub = SUBSCRIPTIONS[productType]; title = `${sub.emoji} ${sub.title}`; amount = sub.stars;
+  if (productType && productType.startsWith('sub_')) {
+    const subId = productType.replace('sub_', '');
+    const sr = await pool.query('SELECT * FROM subscriptions WHERE id = $1 AND enabled = TRUE', [subId]);
+    if (!sr.rows.length) return res.status(404).json({ error: 'Подписка не найдена' });
+    const s = sr.rows[0];
+    title = `${s.emoji} ${s.name}`;
+    amount = Number(s.price) || 0;
     payload = `${productType}:${tgId}:${Date.now()}`;
   } else if (productType === 'custom_tries') {
     const n = Math.max(1, Math.min(500, Number(tries) || 1));
-    amount = n * 5; title = `${n} примерок`; payload = `custom_tries:${tgId}:${n}:${Date.now()}`;
+    const tp = Number(await getSetting('tries_price', '10')) || 10;
+    amount = n * tp; title = `${n} примерок`; payload = `custom_tries:${tgId}:${n}:${Date.now()}`;
   } else if (productType === 'custom_own_tries') {
     const n = Math.max(1, Math.min(500, Number(ownTries) || 1));
     amount = n * 10; title = `${n} своих примерок`; payload = `custom_own_tries:${tgId}:${n}:${Date.now()}`;
