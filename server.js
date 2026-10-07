@@ -2313,7 +2313,6 @@ app.post('/api/save-personalization', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-const PORT = process.env.PORT || 3000;
 app.post('/debug-auth', (req, res) => {
   const initData = (req.body && req.body.initData) || '';
   const p = new URLSearchParams(initData);
