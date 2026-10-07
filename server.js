@@ -508,6 +508,137 @@ app.post('/api/admin/subscriptions/reorder', async (req, res) => {
   }
 });
 
+// ============================================================
+// МОЯ ПОДПИСКА — текущий статус юзера
+// ============================================================
+app.post('/api/my-subscription', async (req, res) => {
+  const { initData } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const r = await pool.query(
+      `SELECT sub_id, sub_started_at, sub_expires_at, sub_tries_total, sub_tries_left
+       FROM users WHERE tg_id = $1`,
+      [tgUser.id]
+    );
+    const u = r.rows[0] || {};
+    if (!u.sub_id) return res.json({ success: true, subscription: null });
+    
+    // Проверяем не истекла ли подписка
+    const expires = u.sub_expires_at ? new Date(u.sub_expires_at) : null;
+    const now = new Date();
+    const isActive = expires && expires > now;
+    const daysLeft = expires ? Math.max(0, Math.ceil((expires - now) / 86400000)) : 0;
+    
+    if (!isActive && u.sub_id) {
+      // Подписка истекла — сбрасываем (примерки из неё сгорают)
+      await pool.query(
+        `UPDATE users SET sub_id = NULL, sub_expires_at = NULL, sub_tries_left = 0, sub_tries_total = 0
+         WHERE tg_id = $1`,
+        [tgUser.id]
+      );
+      return res.json({ success: true, subscription: null, expired: true });
+    }
+    
+    // Получаем данные тарифа из БД
+    const sub = await pool.query(
+      'SELECT id, name, emoji, accent, duration_days, tries FROM subscriptions WHERE id = $1',
+      [u.sub_id]
+    );
+    
+    res.json({
+      success: true,
+      subscription: {
+        id: u.sub_id,
+        name: sub.rows[0]?.name || u.sub_id,
+        emoji: sub.rows[0]?.emoji || '💎',
+        accent: sub.rows[0]?.accent || '#D4B595',
+        expires_at: u.sub_expires_at,
+        days_left: daysLeft,
+        tries_total: u.sub_tries_total || 0,
+        tries_left: u.sub_tries_left || 0,
+        started_at: u.sub_started_at,
+      },
+    });
+  } catch (e) {
+    logError('my-subscription', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
+// ПЕРЕХОД НА ДРУГУЮ ПОДПИСКУ (апгрейд/даунгрейд/продление)
+// ============================================================
+app.post('/api/subscription/switch', async (req, res) => {
+  const { initData, subId } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!subId) return res.status(400).json({ error: 'subId обязателен' });
+  try {
+    const sub = await pool.query(
+      'SELECT * FROM subscriptions WHERE id = $1 AND enabled = TRUE',
+      [subId]
+    );
+    if (!sub.rows.length) return res.status(404).json({ error: 'Подписка не найдена' });
+    const s = sub.rows[0];
+
+    const u = await pool.query(
+      'SELECT sub_id, sub_expires_at, sub_tries_left FROM users WHERE tg_id = $1',
+      [tgUser.id]
+    );
+    const user = u.rows[0] || {};
+
+    let warning = null;
+    // Проверяем есть ли активная подписка
+    if (user.sub_id && user.sub_expires_at && new Date(user.sub_expires_at) > new Date()) {
+      // Если другая подписка — предупреждение о сгорании
+      if (user.sub_id !== subId) {
+        warning = {
+          old_sub_id: user.sub_id,
+          old_tries_left: user.sub_tries_left || 0,
+          message: `Вы переходите с ${user.sub_id} на ${subId}. Неиспользованные примерки сгорят.`,
+        };
+      }
+    }
+
+    const expiresAt = s.duration_days > 0
+      ? new Date(Date.now() + s.duration_days * 86400000)
+      : null;
+
+    // СЕКРЕТНАЯ (duration_days = 0) — примерки добавляются к существующим
+    // Обычные подписки — примерки заменяются
+    const isSecret = s.duration_days === 0;
+
+    if (isSecret) {
+      await pool.query(
+        `UPDATE users SET 
+          balance = balance + $1,
+          sub_id = COALESCE(sub_id, $2),
+          sub_expires_at = CASE WHEN sub_expires_at IS NULL THEN NULL ELSE sub_expires_at END
+         WHERE tg_id = $3`,
+        [s.tries, subId, tgUser.id]
+      );
+    } else {
+      // Обычная подписка — заменяем
+      await pool.query(
+        `UPDATE users SET 
+          sub_id = $1,
+          sub_started_at = NOW(),
+          sub_expires_at = $2,
+          sub_tries_total = $3,
+          sub_tries_left = $3
+         WHERE tg_id = $4`,
+        [subId, expiresAt, s.tries, tgUser.id]
+      );
+    }
+
+    res.json({ success: true, warning });
+  } catch (e) {
+    logError('subscription-switch', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/settings', async (_req, res) => {
   try {
     const maintenance = await isMaintenanceMode();
@@ -1613,10 +1744,49 @@ app.post('/api/webhook/telegram', async (req, res) => {
         else if (productType === 'custom_own_tries') await pool.query('UPDATE users SET own_tries = own_tries + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
         else if (productType === 'gift') {}
         else if (SUBSCRIPTIONS[productType]) {
-          const sub = SUBSCRIPTIONS[productType];
-          await pool.query(`UPDATE users SET balance = balance + $1, own_tries = own_tries + $2, sub_active = TRUE WHERE tg_id = $3`, [sub.tries, sub.own || 0, tgId]);
-          await giveAchievement(tgId, 'first_pay');
-        }
+  const subId = productType.replace('sub_', '');
+  let subData = null;
+  try {
+    const r = await pool.query('SELECT * FROM subscriptions WHERE id = $1', [subId]);
+    subData = r.rows[0];
+  } catch {}
+
+  if (subData) {
+    const expiresAt = subData.duration_days > 0
+      ? new Date(Date.now() + subData.duration_days * 86400000)
+      : null;
+
+    if (subData.duration_days === 0) {
+      // СЕКРЕТНАЯ — добавляем к балансу (бессрочно)
+      await pool.query(
+        `UPDATE users SET balance = balance + $1 WHERE tg_id = $2`,
+        [subData.tries, tgId]
+      );
+    } else {
+      // Обычная подписка — заменяем
+      await pool.query(
+        `UPDATE users SET 
+          sub_id = $1,
+          sub_started_at = NOW(),
+          sub_expires_at = $2,
+          sub_tries_total = $3,
+          sub_tries_left = $3,
+          sub_active = TRUE
+         WHERE tg_id = $4`,
+        [subId, expiresAt, subData.tries, tgId]
+      );
+    }
+  } else {
+    // Фолбэк — старая логика (если тариф удалён из БД)
+    const sub = SUBSCRIPTIONS[productType];
+    await pool.query(
+      `UPDATE users SET balance = balance + $1, own_tries = own_tries + $2, sub_active = TRUE WHERE tg_id = $3`,
+      [sub.tries, sub.own || 0, tgId]
+    );
+  }
+
+  await giveAchievement(tgId, 'first_pay');
+}
       }
     } catch (e) { logError('payment', e.message); }
   }
