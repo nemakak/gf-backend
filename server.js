@@ -566,9 +566,6 @@ app.post('/api/my-subscription', async (req, res) => {
   }
 });
 
-// ============================================================
-// ПЕРЕХОД НА ДРУГУЮ ПОДПИСКУ (апгрейд/даунгрейд/продление)
-// ============================================================
 app.post('/api/subscription/switch', async (req, res) => {
   const { initData, subId } = req.body;
   const tgUser = verifyTelegramInitData(initData);
@@ -583,56 +580,71 @@ app.post('/api/subscription/switch', async (req, res) => {
     const s = sub.rows[0];
 
     const u = await pool.query(
-      'SELECT sub_id, sub_expires_at, sub_tries_left FROM users WHERE tg_id = $1',
+      'SELECT sub_id, sub_expires_at, sub_tries_left, sub_tries_total, balance FROM users WHERE tg_id = $1',
       [tgUser.id]
     );
     const user = u.rows[0] || {};
 
-    let warning = null;
-    // Проверяем есть ли активная подписка
-    if (user.sub_id && user.sub_expires_at && new Date(user.sub_expires_at) > new Date()) {
-      // Если другая подписка — предупреждение о сгорании
-      if (user.sub_id !== subId) {
-        warning = {
-          old_sub_id: user.sub_id,
-          old_tries_left: user.sub_tries_left || 0,
-          message: `Вы переходите с ${user.sub_id} на ${subId}. Неиспользованные примерки сгорят.`,
-        };
-      }
-    }
-
-    const expiresAt = s.duration_days > 0
-      ? new Date(Date.now() + s.duration_days * 86400000)
-      : null;
-
-    // СЕКРЕТНАЯ (duration_days = 0) — примерки добавляются к существующим
-    // Обычные подписки — примерки заменяются
     const isSecret = s.duration_days === 0;
+    const hasActive = user.sub_id && user.sub_expires_at && new Date(user.sub_expires_at) > new Date();
+    const isSameSub = hasActive && user.sub_id === subId;
 
+    // СЕКРЕТНАЯ — просто +примерки, ничего не меняем
     if (isSecret) {
       await pool.query(
-        `UPDATE users SET 
-          balance = balance + $1,
-          sub_id = COALESCE(sub_id, $2),
-          sub_expires_at = CASE WHEN sub_expires_at IS NULL THEN NULL ELSE sub_expires_at END
-         WHERE tg_id = $3`,
-        [s.tries, subId, tgUser.id]
+        'UPDATE users SET balance = balance + $1 WHERE tg_id = $2',
+        [s.tries, tgUser.id]
       );
-    } else {
-      // Обычная подписка — заменяем
-      await pool.query(
-        `UPDATE users SET 
-          sub_id = $1,
-          sub_started_at = NOW(),
-          sub_expires_at = $2,
-          sub_tries_total = $3,
-          sub_tries_left = $3
-         WHERE tg_id = $4`,
-        [subId, expiresAt, s.tries, tgUser.id]
-      );
+      return res.json({
+        success: true,
+        mode: 'secret',
+        tries_added: s.tries,
+      });
     }
 
-    res.json({ success: true, warning });
+    // ПРОДЛЕНИЕ ТОЙ ЖЕ ПОДПИСКИ — примерки копятся
+    if (isSameSub) {
+      const newExpires = new Date(Math.max(
+        new Date(user.sub_expires_at).getTime(),
+        Date.now()
+      ) + s.duration_days * 86400000);
+
+      await pool.query(
+        `UPDATE users SET 
+          sub_expires_at = $1,
+          sub_tries_total = sub_tries_total + $2,
+          sub_tries_left = sub_tries_left + $2,
+          sub_started_at = NOW()
+         WHERE tg_id = $3`,
+        [newExpires, s.tries, tgUser.id]
+      );
+      return res.json({
+        success: true,
+        mode: 'renew',
+        tries_added: s.tries,
+        new_expires: newExpires,
+      });
+    }
+
+    // ПЕРЕХОД НА ДРУГУЮ — примерки сгорают, выдаются новые
+    const expiresAt = new Date(Date.now() + s.duration_days * 86400000);
+    await pool.query(
+      `UPDATE users SET 
+        sub_id = $1,
+        sub_started_at = NOW(),
+        sub_expires_at = $2,
+        sub_tries_total = $3,
+        sub_tries_left = $3
+       WHERE tg_id = $4`,
+      [subId, expiresAt, s.tries, tgUser.id]
+    );
+
+    return res.json({
+      success: true,
+      mode: 'switch',
+      tries_added: s.tries,
+      old_tries_lost: user.sub_tries_left || 0,
+    });
   } catch (e) {
     logError('subscription-switch', e.message);
     res.status(500).json({ error: e.message });
@@ -1752,18 +1764,32 @@ app.post('/api/webhook/telegram', async (req, res) => {
   } catch {}
 
   if (subData) {
-    const expiresAt = subData.duration_days > 0
-      ? new Date(Date.now() + subData.duration_days * 86400000)
-      : null;
+    const isSecret = subData.duration_days === 0;
+    const u = await pool.query('SELECT sub_id, sub_expires_at, sub_tries_total, sub_tries_left FROM users WHERE tg_id = $1', [tgId]);
+    const user = u.rows[0] || {};
+    const hasActive = user.sub_id && user.sub_expires_at && new Date(user.sub_expires_at) > new Date();
+    const isSameSub = hasActive && user.sub_id === subId;
 
-    if (subData.duration_days === 0) {
-      // СЕКРЕТНАЯ — добавляем к балансу (бессрочно)
+    if (isSecret) {
+      // СЕКРЕТНАЯ — просто +примерки
+      await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [subData.tries, tgId]);
+      sendMessage(tgId, `🎁 <b>+${subData.tries} примерки!</b>\n\nНачислены на баланс`).catch(() => {});
+    } else if (isSameSub) {
+      // ПРОДЛЕНИЕ — примерки копятся
+      const newExpires = new Date(Math.max(new Date(user.sub_expires_at).getTime(), Date.now()) + subData.duration_days * 86400000);
       await pool.query(
-        `UPDATE users SET balance = balance + $1 WHERE tg_id = $2`,
-        [subData.tries, tgId]
+        `UPDATE users SET 
+          sub_expires_at = $1,
+          sub_tries_total = sub_tries_total + $2,
+          sub_tries_left = sub_tries_left + $2,
+          sub_started_at = NOW()
+         WHERE tg_id = $3`,
+        [newExpires, subData.tries, tgId]
       );
+      sendMessage(tgId, `💎 <b>Подписка продлена!</b>\n\n+${subData.tries} примерок\nДействует до ${newExpires.toLocaleDateString('ru-RU')}`).catch(() => {});
     } else {
-      // Обычная подписка — заменяем
+      // ПЕРЕХОД — примерки сгорают
+      const expiresAt = new Date(Date.now() + subData.duration_days * 86400000);
       await pool.query(
         `UPDATE users SET 
           sub_id = $1,
@@ -1775,14 +1801,12 @@ app.post('/api/webhook/telegram', async (req, res) => {
          WHERE tg_id = $4`,
         [subId, expiresAt, subData.tries, tgId]
       );
+      sendMessage(tgId, `✨ <b>Подписка активирована!</b>\n\n${subData.emoji} ${subData.name}\n${subData.tries} примерок\nДействует до ${expiresAt.toLocaleDateString('ru-RU')}`).catch(() => {});
     }
   } else {
-    // Фолбэк — старая логика (если тариф удалён из БД)
+    // Фолбэк
     const sub = SUBSCRIPTIONS[productType];
-    await pool.query(
-      `UPDATE users SET balance = balance + $1, own_tries = own_tries + $2, sub_active = TRUE WHERE tg_id = $3`,
-      [sub.tries, sub.own || 0, tgId]
-    );
+    await pool.query(`UPDATE users SET balance = balance + $1, own_tries = own_tries + $2, sub_active = TRUE WHERE tg_id = $3`, [sub.tries, sub.own || 0, tgId]);
   }
 
   await giveAchievement(tgId, 'first_pay');
