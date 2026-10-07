@@ -1096,6 +1096,135 @@ app.post('/api/tryon-multi', async (req, res) => {
   } catch (e) { logError('tryon-multi', e.message); res.json({ success: false, error: 'Что-то пошло не так.' }); }
 });
 
+// ============================================================
+// СЕРИЯ — тик таймера (вызывается каждые 30 сек с фронта)
+// ============================================================
+app.post('/api/streak/tick', async (req, res) => {
+  const { initData, seconds } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  const sec = Math.max(0, Math.min(60, Number(seconds) || 0));
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const r = await pool.query(
+      'SELECT streak_seconds_today, streak_timer_date, streak_days, streak_last_counted FROM users WHERE tg_id = $1',
+      [tgUser.id]
+    );
+    const u = r.rows[0];
+    if (!u) return res.status(404).json({ error: 'User not found' });
+
+    const lastTimerDate = u.streak_timer_date ? new Date(u.streak_timer_date).toISOString().slice(0, 10) : null;
+    const currentSeconds = (lastTimerDate === today) ? (u.streak_seconds_today || 0) : 0;
+    const newSeconds = Math.min(600, currentSeconds + sec);
+
+    const REACHED = newSeconds >= 600;
+    const wasAlready = currentSeconds >= 600;
+
+    await pool.query(
+      'UPDATE users SET streak_seconds_today = $1, streak_timer_date = CURRENT_DATE WHERE tg_id = $2',
+      [newSeconds, tgUser.id]
+    );
+
+    let streakDays = u.streak_days || 0;
+    let rewarded = false;
+    let just_completed = false;
+
+    if (REACHED && !wasAlready) {
+      just_completed = true;
+      const lastCounted = u.streak_last_counted ? new Date(u.streak_last_counted).toISOString().slice(0, 10) : null;
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+
+      // Сгорание серии если пропущен день
+      if (lastCounted && lastCounted !== today && lastCounted !== yesterday) {
+        streakDays = 0;
+      }
+
+      // Серия стартует: если вчера не было — начинается с 1
+      let newStreakDays;
+      if (lastCounted === yesterday) {
+        newStreakDays = streakDays + 1;
+      } else {
+        newStreakDays = 1;
+      }
+
+      await pool.query(
+        'UPDATE users SET streak_days = $1, streak_last_counted = CURRENT_DATE WHERE tg_id = $2',
+        [newStreakDays, tgUser.id]
+      );
+
+      streakDays = newStreakDays;
+
+      const dayInCycle = ((newStreakDays - 1) % 5) + 1;
+      let reward = { enabled: true, tries: 0, own_tries: 0, text: '' };
+      try {
+        const rr = await pool.query('SELECT * FROM streak_rewards WHERE day = $1', [dayInCycle]);
+        if (rr.rows.length) reward = rr.rows[0];
+      } catch {}
+
+      if (reward.enabled && (reward.tries > 0 || reward.own_tries > 0)) {
+        if (reward.tries > 0) {
+          await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [reward.tries, tgUser.id]);
+        }
+        if (reward.own_tries > 0) {
+          await pool.query('UPDATE users SET own_tries = own_tries + $1 WHERE tg_id = $2', [reward.own_tries, tgUser.id]);
+        }
+        const msg = reward.text || `🔥 Серия ${newStreakDays} · +${reward.tries + reward.own_tries}`;
+        sendMessage(tgUser.id, `🔥 <b>Серия ${newStreakDays} дней!</b>\n\n${msg}`).catch(() => {});
+        rewarded = true;
+      }
+
+      if (newStreakDays === 3) await giveAchievement(tgUser.id, 'streak_3');
+      if (newStreakDays === 5) await giveAchievement(tgUser.id, 'streak_5');
+      if (newStreakDays === 7) await giveAchievement(tgUser.id, 'streak_7');
+    }
+
+    res.json({
+      success: true,
+      seconds_today: newSeconds,
+      streak_days: streakDays,
+      reached_ten_min: REACHED,
+      rewarded,
+      just_completed,
+    });
+  } catch (e) {
+    logError('streak-tick', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
+// СЕРИЯ — статус (для отображения при загрузке)
+// ============================================================
+app.post('/api/streak/status', async (req, res) => {
+  const { initData } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const r = await pool.query(
+      'SELECT streak_seconds_today, streak_timer_date, streak_days FROM users WHERE tg_id = $1',
+      [tgUser.id]
+    );
+    const u = r.rows[0];
+    if (!u) return res.status(404).json({ error: 'User not found' });
+
+    const lastTimerDate = u.streak_timer_date ? new Date(u.streak_timer_date).toISOString().slice(0, 10) : null;
+    const secondsToday = (lastTimerDate === today) ? (u.streak_seconds_today || 0) : 0;
+
+    res.json({
+      success: true,
+      seconds_today: secondsToday,
+      seconds_left: Math.max(0, 600 - secondsToday),
+      streak_days: u.streak_days || 0,
+      reached_ten_min: secondsToday >= 600,
+    });
+  } catch (e) {
+    logError('streak-status', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 app.post('/api/history', async (req, res) => {
   const { initData } = req.body;
   const tgUser = verifyTelegramInitData(initData);
