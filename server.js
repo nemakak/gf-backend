@@ -1029,7 +1029,7 @@ app.post('/api/tryon', async (req, res) => {
     });
     res.json({ success: false, error: 'Что-то пошло не так.' });
   }
-
+});
 app.post('/api/tryon-by-link', async (req, res) => {
   const { initData, humanImg, wbLink } = req.body;
   const tgUser = verifyTelegramInitData(initData);
@@ -2416,4 +2416,5 @@ app.get('/api/catalog-personal', async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+  const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
