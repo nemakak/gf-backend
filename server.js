@@ -164,25 +164,6 @@ function verifyTelegramInitData(initData) {
     return ok ? JSON.parse(p.get('user')) : null;
   } catch { return null; }
 }
-app.post('/debug-auth', (req, res) => {
-  const initData = req.body.initData || '';
-  const p = new URLSearchParams(initData);
-  const hash = p.get('hash') || '';
-  p.delete('hash');
-  const str = [...p.entries()].sort().map(([k, v]) => `${k}=${v}`).join('\n');
-  const key = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
-  const calc = crypto.createHmac('sha256', key).update(str).digest('hex');
-  res.json({
-    hasToken: !!BOT_TOKEN,
-    tokenPrefix: BOT_TOKEN ? BOT_TOKEN.slice(0, 12) + '…' : null,
-    tokenLength: BOT_TOKEN ? BOT_TOKEN.length : 0,
-    initDataLength: initData.length,
-    hashFromTelegram: hash.slice(0, 12) + '…',
-    hashCalculated: calc.slice(0, 12) + '…',
-    match: hash === calc,
-    userName: (() => { try { return JSON.parse(p.get('user') || '{}').username; } catch { return null; } })(),
-  });
-});
 async function tgApi(method, payload) {
   const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
   return r.json();
@@ -2068,7 +2049,7 @@ app.post('/api/admin/products/action', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-// ============================================================ // ПОИСК по всей базе товаров // ============================================================ app.get('// ============================================================ // ПОИСК: сортировка по числу совпадений + морфология (pg_trgm) // ============================================================ app.get('app.get('/api/search', async (req, res) => {   const raw = String(req.query.q || '').trim().toLowerCase();   const limit = Math.min(100, Number(req.query.limit) || 50);   if (raw.length < 2) return res.json({ success: true, items: [] });    try {     const words = raw.split(/\s+/).filter(w => w.length >= 2);     if (!words.length) return res.json({ success: true, items: [] });      // Корень слова: режем русские окончания, оставляем минимум 4 буквы     const stem = (w) => {       if (w.length <= 4) return w;       const stripped = w.replace(/(иями|ями|ами|ией|иях|иям|ию|ия|ие|ые|ых|ой|ый|ая|ое|ов|ам|ах|ям|ях|ом|ем|у|ю|ы|и|а|я|е|о|й|ь)$/u, '');       return stripped.length >= 4 ? stripped : w.slice(0, 4);     };      const params = [];     const scoreParts = [];     const whereParts = [];      for (const w of words) {       const r = stem(w);       params.push(`%${w}%`, `%${r}%`);       const wIdx = params.length - 1;       const rIdx = params.length;       whereParts.push(`(LOWER(name) LIKE $${wIdx} OR LOWER(name) LIKE $${rIdx})`);       scoreParts.push(`(CASE WHEN LOWER(name) LIKE $${wIdx} THEN 2 ELSE 0 END)`);       scoreParts.push(`(CASE WHEN LOWER(name) LIKE $${rIdx} THEN 1 ELSE 0 END)`);     }      params.push(String(Date.now()));     const seedIdx = params.length;     params.push(limit);     const limitIdx = params.length;      const sql = `       SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url,         (${scoreParts.join(' + ')}) AS match_score       FROM products       WHERE is_active = TRUE AND (${whereParts.join(' OR ')})       ORDER BY match_score DESC, MD5(id::text || $${seedIdx}) ASC       LIMIT $${limitIdx}     `;     const r = await pool.query(sql, params);     const items = r.rows.map(({ match_score, ...rest }) => rest);     res.json({ success: true, items, count: items.length });   } catch (e) {     logError('search', e.message);     res.status(500).json({ error: 'Server error' });   } });', async (req, res) => {   const raw = String(req.query.q || '').trim().toLowerCase();   const limit = Math.min(100, Number(req.query.limit) || 50);   if (raw.length < 2) return res.json({ success: true, items: [] });    try {     // Разбиваем запрос на слова, длиной >= 2     const words = raw.split(/\s+/).filter(w => w.length >= 2);     if (!words.length) return res.json({ success: true, items: [] });      // Для каждого слова строим "корень" — обрезаем окончания     // Например: "костюмы" → "костюм", "платья" → "плать"     const roots = words.map(w => {       if (w.length <= 4) return w;                    // короткие не трогаем       // Убираем частые русские окончания       return w         .replace(/(иями|ями|ами|ией|иях|иям|ию|ия|ие|ые|ых|ой|ый|ая|ое|ов|ам|ах|ям|ях|ом|ем|у|ю|ы|и|а|я|е|о|й|ь)$/u, '')         || w.slice(0, Math.max(3, w.length - 2));     // если после среза пусто — режем 2 символа     });      // Каждое слово ищем и как есть, и как корень     // Собираем SQL: для каждого слова по 2 условия LIKE     const params = [];     const scoreParts = []; // считает количество совпавших слов     const whereParts = []; // основное условие OR      for (let i = 0; i < words.length; i++) {       const w = words[i];       const r = roots[i];        params.push(`%${w}%`, `%${r}%`);       const wIdx = params.length - 1;      // индекс %w%       const rIdx = params.length;          // индекс %r%        // WHERE: слово найдено либо целиком, либо по корню       whereParts.push(`(LOWER(name) LIKE $${wIdx} OR LOWER(name) LIKE $${rIdx})`);        // SCORE: +1 если слово совпало (в любом виде), +2 если слово в начале названия       scoreParts.push(         `(CASE WHEN LOWER(name) LIKE $${wIdx} OR LOWER(name) LIKE $${rIdx} THEN 1 ELSE 0 END)`       );       scoreParts.push(         `(CASE WHEN LOWER(name) LIKE $${params.length + 1} THEN 2 ELSE 0 END)`       );       params.push(`${w}%`);                // префикс без % в начале     }      // seed для рандома + limit     params.push(String(Date.now()));     const seedIdx = params.length;     params.push(limit);     const limitIdx = params.length;      const sql = `       SELECT         id, wb_id, name, price, category, image_url, fallback_url, description, source_url,         (${scoreParts.join(' + ')}) AS match_score       FROM products       WHERE is_active = TRUE         AND (${whereParts.join(' OR ')})       ORDER BY         match_score DESC,         MD5(id::text || $${seedIdx}) ASC       LIMIT $${limitIdx}     `;      const r = await pool.query(sql, params);      // Убираем match_score из ответа — фронту он не нужен     const items = r.rows.map(({ match_score, ...rest }) => rest);      res.json({ success: true, items, count: items.length });   } catch (e) {     logError('search', e.message);     // fallback: если pg_trgm не установлен — простой LIKE без морфологии     try {       const words = raw.split(/\s+/).filter(w => w.length >= 2);       if (!words.length) return res.json({ success: true, items: [] });       const params = [];       const conds = words.map(w => {         params.push(`%${w}%`);         return `LOWER(name) LIKE $${params.length}`;       });       params.push(limit);       const sql = `         SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url         FROM products         WHERE is_active = TRUE AND (${conds.join(' OR ')})         ORDER BY MD5(id::text || '${Date.now()}') ASC         LIMIT $${params.length}       `;       const r = await pool.query(sql, params);       res.json({ success: true, items: r.rows, fallback: true });     } catch (e2) {       res.status(500).json({ error: 'Server error' });     }   } });', async (req, res) => {   const q = String(req.query.q || '').trim().toLowerCase();   const limit = Math.min(100, Number(req.query.limit) || 50);   if (q.length < 2) return res.json({ success: true, items: [] });    try {     // Разбиваем запрос на слова и ищем ЛЮБОЕ совпадение (OR)     const words = q.split(/\s+/).filter(w => w.length >= 2);     if (!words.length) return res.json({ success: true, items: [] });      const params = [];     const likeClauses = words.map(w => {       params.push(`%${w}%`);       return `LOWER(name) LIKE $${params.length}`;     });      // Плюс приоритет: если название начинается с первого слова — выше     params.push(`${words[0]}%`);     const prefixIdx = params.length;      params.push(String(Date.now()));     const seedIdx = params.length;      params.push(limit);     const limitIdx = params.length;      const sql = `       SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url       FROM products       WHERE is_active = TRUE         AND (${likeClauses.join(' OR ')})       ORDER BY         CASE WHEN LOWER(name) LIKE $${prefixIdx} THEN 0 ELSE 1 END,         MD5(id::text || $${seedIdx}) ASC       LIMIT $${limitIdx}     `;      const r = await pool.query(sql, params);     res.json({ success: true, items: r.rows });   } catch (e) {     logError('search', e.message);     res.status(500).json({ error: 'Server error' });   } }); res.send('GF Style Room API ✨'));
+
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 cron.schedule('0 */2 * * *', () => { refreshCatalog(); });
@@ -2181,85 +2162,6 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// ============================================================
-// ПЕРСОНАЛЬНЫЙ КАТАЛОГ — на основе истории просмотров
-// ============================================================
-app.get('/api/catalog-personal', async (req, res) => {
-  const initData = req.headers['x-init-data'] || '';
-  const limit = Math.min(50, Number(req.query.limit) || 40);
-  const tgUser = verifyTelegramInitData(initData);
-
-  // Гость — отдаём случайные
-  if (!tgUser) {
-    try {
-      const r = await pool.query(
-        `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
-         FROM products WHERE is_active = TRUE
-         ORDER BY RANDOM() LIMIT $1`, [limit]
-      );
-      return res.json({ success: true, items: r.rows, personalized: false });
-    } catch { return res.json({ success: true, items: [] }); }
-  }
-
-  try {
-    // 1) Любимые категории по просмотрам и примеркам за 30 дней
-    const prefs = await pool.query(
-      `SELECT category, COUNT(*)::int AS c
-       FROM product_views
-       WHERE user_id = $1 AND viewed_at > NOW() - INTERVAL '30 days' AND category IS NOT NULL
-       GROUP BY category ORDER BY c DESC LIMIT 3`,
-      [tgUser.id]
-    );
-
-    const topCats = prefs.rows.map(x => x.category);
-
-    // 2) Если истории мало — добавляем категории по примеркам
-    if (topCats.length < 2) {
-      const tried = await pool.query(
-        `SELECT p.category, COUNT(*)::int AS c
-         FROM tryon_history t JOIN products p ON p.id = t.product_id
-         WHERE t.user_id = $1 AND t.created_at > NOW() - INTERVAL '30 days'
-         GROUP BY p.category ORDER BY c DESC LIMIT 3`,
-        [tgUser.id]
-      );
-      for (const row of tried.rows) {
-        if (row.category && !topCats.includes(row.category)) topCats.push(row.category);
-      }
-    }
-
-    // 3) Если совсем ничего — рандом
-    if (!topCats.length) {
-      const r = await pool.query(
-        `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
-         FROM products WHERE is_active = TRUE ORDER BY RANDOM() LIMIT $1`, [limit]
-      );
-      return res.json({ success: true, items: r.rows, personalized: false });
-    }
-
-    // 4) 70% — из любимых категорий, 30% — остальное
-    const favLimit = Math.ceil(limit * 0.7);
-    const randLimit = limit - favLimit;
-
-    const fav = await pool.query(
-      `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
-       FROM products WHERE is_active = TRUE AND category = ANY($1)
-       ORDER BY RANDOM() LIMIT $2`,
-      [topCats, favLimit]
-    );
-    const rand = await pool.query(
-      `SELECT id, wb_id, name, price, category, image_url, fallback_url, description, source_url
-       FROM products WHERE is_active = TRUE AND category != ALL($1)
-       ORDER BY RANDOM() LIMIT $2`,
-      [topCats, randLimit]
-    );
-
-    const items = [...fav.rows, ...rand.rows].sort(() => Math.random() - 0.5);
-    res.json({ success: true, items, personalized: true, topCats });
-  } catch (e) {
-    logError('catalog-personal', e.message);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
 // ============================================================
 // СЕРИЯ — награды по дням (админ + клиент)
 // ============================================================
@@ -2452,26 +2354,6 @@ app.post('/debug-auth', (req, res) => {
     initDataLength: initData.length,
     hashMatch: hash === calc,
   });
-});
-// ============================================================
-// ПЕРСОНАЛИЗАЦИЯ (сохранить ответы теста)
-// ============================================================
-app.post('/api/save-personalization', async (req, res) => {
-  const { initData, answers } = req.body;
-  const tgUser = verifyTelegramInitData(initData);
-  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS personalization JSONB`);
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS personalized BOOLEAN DEFAULT FALSE`);
-    await pool.query(
-      `UPDATE users SET personalization = $1, personalized = TRUE WHERE tg_id = $2`,
-      [JSON.stringify(answers || {}), tgUser.id]
-    );
-    res.json({ success: true });
-  } catch (e) {
-    logError('save-personalization', e.message);
-    res.status(500).json({ error: e.message });
-  }
 });
 
 // ============================================================
