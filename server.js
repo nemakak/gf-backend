@@ -967,11 +967,11 @@ app.post('/api/tryon', async (req, res) => {
     const user = u.rows[0];
     if (user.is_banned) return res.status(403).json({ error: 'Вы заблокированы' });
     const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
-    if (!hasUnlimited && user.balance <= 0) return res.status(402).json({ error: 'Нет попыток' });
+    const subActive = user.sub_tries_left > 0 && user.sub_expires_at && new Date(user.sub_expires_at) > new Date();     if (!hasUnlimited && user.balance <= 0 && !subActive) return res.status(402).json({ error: 'Нет попыток' });
     const { url: resultUrl, model } = await runFalTryon({ humanImg, garmentUrl, category });
     await logGeneration(tgId, model, !!resultUrl, itemId);
     if (!resultUrl) return res.json({ success: false, error: 'Не получилось. Попробуй другое фото.' });
-    if (!hasUnlimited) await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);
+    if (!hasUnlimited) {       const subCheck = await pool.query('SELECT sub_tries_left, sub_expires_at FROM users WHERE tg_id = $1', [tgId]);       const usr = subCheck.rows[0] || {};       const isSubActive = usr.sub_tries_left > 0 && usr.sub_expires_at && new Date(usr.sub_expires_at) > new Date();       if (isSubActive) {         await pool.query('UPDATE users SET sub_tries_left = sub_tries_left - 1 WHERE tg_id = $1', [tgId]);       } else {         await pool.query('UPDATE users SET balance = balance - 1 WHERE tg_id = $1', [tgId]);       }     }
     const snap = itemId ? (await pool.query('SELECT wb_id, name, image_url FROM products WHERE id = $1', [itemId])).rows[0] || {} : {};
     await pool.query(`INSERT INTO tryon_history (user_id, product_id, product_wb_id, product_name, product_image, result_url, is_mock, category) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [tgId, itemId ? Number(itemId) : null, snap.wb_id || null, snap.name || null, snap.image_url || null, resultUrl, false, category || null]);
     const total = await pool.query('SELECT COUNT(*)::int AS c FROM tryon_history WHERE user_id = $1', [tgId]);
@@ -1059,7 +1059,7 @@ app.post('/api/tryon-multi', async (req, res) => {
     if (user.is_banned) return res.status(403).json({ error: 'Заблокированы' });
     const hasUnlimited = user.unlimited_until && new Date(user.unlimited_until) > new Date();
     const need = items.length;
-    if (!hasUnlimited && user.balance < need) return res.status(402).json({ error: `Нужно ${need} попыток` });
+    const subAvail = (user.sub_tries_left || 0) + (user.balance || 0);     if (!hasUnlimited && subAvail < need) return res.status(402).json({ error: `Нужно ${need} попыток` });
     const results = []; let prevImg = humanImg; let success = 0;
     for (const item of items) {
       const { url, model } = await runFalTryon({ humanImg: prevImg, garmentUrl: item.image_url, category: item.category });
@@ -1067,7 +1067,7 @@ app.post('/api/tryon-multi', async (req, res) => {
       if (url) { results.push({ itemId: item.id, name: item.name, url }); prevImg = url; success++; }
       else results.push({ itemId: item.id, name: item.name, url: null });
     }
-    if (!hasUnlimited && success > 0) await pool.query('UPDATE users SET balance = GREATEST(0, balance - $1) WHERE tg_id = $2', [success, tgId]);
+    if (!hasUnlimited && success > 0) {       const subLeft = user.sub_tries_left || 0;       const fromSub = Math.min(subLeft, success);       const fromBalance = success - fromSub;       if (fromSub > 0) await pool.query('UPDATE users SET sub_tries_left = GREATEST(0, sub_tries_left - $1) WHERE tg_id = $2', [fromSub, tgId]);       if (fromBalance > 0) await pool.query('UPDATE users SET balance = GREATEST(0, balance - $1) WHERE tg_id = $2', [fromBalance, tgId]);     }
     for (const r of results) {
       if (r.url) await pool.query(`INSERT INTO tryon_history (user_id, product_id, product_name, result_url, is_mock) VALUES ($1,$2,$3,$4,$5)`, [tgId, r.itemId || null, r.name || null, r.url, false]);
     }
@@ -1911,7 +1911,7 @@ app.post('/api/webhook/telegram', async (req, res) => {
         else if (productType === 'custom_tries') await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
         else if (productType === 'custom_own_tries') await pool.query('UPDATE users SET own_tries = own_tries + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
         else if (productType === 'gift') {}
-        else if (SUBSCRIPTIONS[productType]) {
+        else if (productType.startsWith('sub_')) {
   const subId = productType.replace('sub_', '');
   let subData = null;
   try {
@@ -1960,9 +1960,9 @@ app.post('/api/webhook/telegram', async (req, res) => {
       sendMessage(tgId, `✨ <b>Подписка активирована!</b>\n\n${subData.emoji} ${subData.name}\n${subData.tries} примерок\nДействует до ${expiresAt.toLocaleDateString('ru-RU')}`).catch(() => {});
     }
   } else {
-    // Фолбэк
-    const sub = SUBSCRIPTIONS[productType];
-    await pool.query(`UPDATE users SET balance = balance + $1, own_tries = own_tries + $2, sub_active = TRUE WHERE tg_id = $3`, [sub.tries, sub.own || 0, tgId]);
+        // Подписка не найдена в БД
+    console.error('[payment sub] not found for', productType, 'and', subId);
+    sendMessage(tgId, `⚠️ Подписка не найдена. Обратитесь в поддержку.`).catch(() => {});
   }
 
   await giveAchievement(tgId, 'first_pay');
