@@ -1938,24 +1938,18 @@ app.post('/api/webhook/telegram', async (req, res) => {
     const hasActive = user.sub_id && user.sub_expires_at && new Date(user.sub_expires_at) > new Date();
     const isSameSub = hasActive && user.sub_id === subId;
 
-    if (isSecret) {
-      // СЕКРЕТНАЯ — просто +примерки
-      await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [subData.tries, tgId]);
+        if (isSecret) {
+      // Проверяем, покупал ли уже
+      const checkRow = await pool.query('SELECT secret_bought FROM users WHERE tg_id = $1', [tgId]);
+      if (checkRow.rows[0]?.secret_bought) {
+        // Уже покупал — не начисляем повторно
+        console.log('[payment] secret already bought by', tgId);
+        return;
+      }
+      // СЕКРЕТНАЯ — просто +примерки, помечаем как купленную
+      await pool.query('UPDATE users SET balance = balance + $1, secret_bought = TRUE WHERE tg_id = $2', [subData.tries, tgId]);
       sendMessage(tgId, `🎁 <b>+${subData.tries} примерки!</b>\n\nНачислены на баланс`).catch(() => {});
-    } else if (isSameSub) {
-      // ПРОДЛЕНИЕ — примерки копятся
-      const newExpires = new Date(Math.max(new Date(user.sub_expires_at).getTime(), Date.now()) + subData.duration_days * 86400000);
-      await pool.query(
-        `UPDATE users SET 
-          sub_expires_at = $1,
-          sub_tries_total = sub_tries_total + $2,
-          sub_tries_left = sub_tries_left + $2,
-          sub_started_at = NOW()
-         WHERE tg_id = $3`,
-        [newExpires, subData.tries, tgId]
-      );
-      sendMessage(tgId, `💎 <b>Подписка продлена!</b>\n\n+${subData.tries} примерок\nДействует до ${newExpires.toLocaleDateString('ru-RU')}`).catch(() => {});
-    } else {
+    }
       // ПЕРЕХОД — примерки сгорают
       const expiresAt = new Date(Date.now() + subData.duration_days * 86400000);
       await pool.query(
