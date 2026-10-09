@@ -535,19 +535,32 @@ app.post('/api/my-subscription', async (req, res) => {
        FROM users WHERE tg_id = $1`,
       [tgUser.id]
     );
-        const u = r.rows[0] || {};
+            const u = r.rows[0] || {};
     if (!u.sub_id) return res.json({ success: true, subscription: null });
 
-// После проверки isActive
-if (isActive && (u.sub_tries_left || 0) <= 0) {
-  // Примерки кончились — деактивируем подписку
-  await pool.query(
-    `UPDATE users SET sub_id = NULL, sub_expires_at = NULL, sub_tries_left = 0, sub_tries_total = 0
-     WHERE tg_id = $1`,
-    [tgUser.id]
-  );
-  return res.json({ success: true, subscription: null, depleted: true });
-}
+    // Считаем срок
+    const expires = u.sub_expires_at ? new Date(u.sub_expires_at) : null;
+    const now = new Date();
+    const isActive = expires && expires > now;
+    const daysLeft = expires ? Math.max(0, Math.ceil((expires - now) / 86400000)) : 0;
+
+    // Подписка истекла — сбрасываем
+    if (!isActive) {
+      await pool.query(
+        `UPDATE users SET sub_id = NULL, sub_expires_at = NULL, sub_tries_left = 0, sub_tries_total = 0 WHERE tg_id = $1`,
+        [tgUser.id]
+      );
+      return res.json({ success: true, subscription: null, expired: true });
+    }
+
+    // Примерки кончились — деактивируем
+    if ((u.sub_tries_left || 0) <= 0) {
+      await pool.query(
+        `UPDATE users SET sub_id = NULL, sub_expires_at = NULL, sub_tries_left = 0, sub_tries_total = 0 WHERE tg_id = $1`,
+        [tgUser.id]
+      );
+      return res.json({ success: true, subscription: null, depleted: true });
+    }
     
     // Проверяем не истекла ли подписка
     const expires = u.sub_expires_at ? new Date(u.sub_expires_at) : null;
@@ -2044,6 +2057,63 @@ app.post('/api/admin/products/list', async (req, res) => {
     logError('admin-products-list', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// Выдать подписку юзеру вручную
+app.post('/api/admin/user-sub/grant', async (req, res) => {
+  const { initData, tgId, subId } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  if (!tgId || !subId) return res.status(400).json({ error: 'tgId и subId обязательны' });
+  try {
+    const sub = await pool.query('SELECT * FROM subscriptions WHERE id = $1', [subId]);
+    if (!sub.rows.length) return res.status(404).json({ error: 'Подписка не найдена' });
+    const s = sub.rows[0];
+    const isSecret = s.duration_days === 0;
+    if (isSecret) {
+      await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [s.tries, tgId]);
+    } else {
+      const expiresAt = new Date(Date.now() + s.duration_days * 86400000);
+      await pool.query(
+        `UPDATE users SET sub_id = $1, sub_started_at = NOW(), sub_expires_at = $2, sub_tries_total = $3, sub_tries_left = $3, sub_active = TRUE WHERE tg_id = $4`,
+        [subId, expiresAt, s.tries, tgId]
+      );
+    }
+    res.json({ success: true });
+  } catch (e) { logError('admin-user-sub-grant', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Забрать подписку у юзера
+app.post('/api/admin/user-sub/revoke', async (req, res) => {
+  const { initData, tgId } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  if (!tgId) return res.status(400).json({ error: 'tgId обязателен' });
+  try {
+    await pool.query(
+      `UPDATE users SET sub_id = NULL, sub_expires_at = NULL, sub_tries_left = 0, sub_tries_total = 0, sub_active = FALSE WHERE tg_id = $1`,
+      [tgId]
+    );
+    res.json({ success: true });
+  } catch (e) { logError('admin-user-sub-revoke', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Получить подписку конкретного юзера
+app.post('/api/admin/user-sub/get', async (req, res) => {
+  const { initData, tgId } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  if (!tgId) return res.status(400).json({ error: 'tgId обязателен' });
+  try {
+    const r = await pool.query(
+      `SELECT sub_id, sub_started_at, sub_expires_at, sub_tries_total, sub_tries_left FROM users WHERE tg_id = $1`,
+      [tgId]
+    );
+    res.json({ success: true, sub: r.rows[0] || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // 3) Действия над товаром: pin/unpin/hide/unhide/delete
