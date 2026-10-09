@@ -363,9 +363,9 @@ app.post('/api/auth', async (req, res) => {
       }
     }
 
-    res.json({
+        res.json({
   success: true,
-  user: { ...user, streak_days: streakDays, personalized: user.personalized || false },
+  user: { ...user, streak_days: streakDays, personalized: user.personalized || false, secret_bought: user.secret_bought || false },
   daily_bonus: dailyBonus,
   streak_bonus: streakBonus,
   streak_enabled: streakEnabled,
