@@ -2034,6 +2034,38 @@ app.post('/api/admin/products/list', async (req, res) => {
   }
 });
 
+// Добавить примерки в подписку юзера
+app.post('/api/admin/user-sub/add-tries', async (req, res) => {
+  const { initData, tgId, count } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  if (!tgId || !Number.isFinite(count) || count === 0) return res.status(400).json({ error: 'Некорректно' });
+  try {
+    await pool.query(
+      `UPDATE users SET sub_tries_total = GREATEST(0, sub_tries_total + $1), sub_tries_left = GREATEST(0, sub_tries_left + $1) WHERE tg_id = $2`,
+      [count, tgId]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Изменить количество (для произвольного значения)
+app.post('/api/admin/user-sub/set-tries', async (req, res) => {
+  const { initData, tgId, tries_left, tries_total } = req.body;
+  const tgUser = verifyTelegramInitData(initData);
+  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
+  if (!tgId) return res.status(400).json({ error: 'tgId обязателен' });
+  try {
+    await pool.query(
+      `UPDATE users SET sub_tries_left = $1, sub_tries_total = $2 WHERE tg_id = $3`,
+      [Math.max(0, Number(tries_left) || 0), Math.max(0, Number(tries_total) || 0), tgId]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Выдать подписку юзеру вручную
 app.post('/api/admin/user-sub/grant', async (req, res) => {
   const { initData, tgId, subId } = req.body;
