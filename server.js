@@ -535,7 +535,7 @@ app.post('/api/my-subscription', async (req, res) => {
        FROM users WHERE tg_id = $1`,
       [tgUser.id]
     );
-    const u = r.rows[0] || {};
+        const u = r.rows[0] || {};
     if (!u.sub_id) return res.json({ success: true, subscription: null });
 
 // После проверки isActive
@@ -557,6 +557,15 @@ if (isActive && (u.sub_tries_left || 0) <= 0) {
 
     // Примерки кончились — деактивируем
     if (isActive && (u.sub_tries_left || 0) <= 0) {
+      await pool.query(
+        `UPDATE users SET sub_id = NULL, sub_expires_at = NULL, sub_tries_left = 0, sub_tries_total = 0
+         WHERE tg_id = $1`,
+        [tgUser.id]
+      );
+      return res.json({ success: true, subscription: null, depleted: true });
+    }
+    
+    if (!isActive && u.sub_id) {
       await pool.query(
         `UPDATE users SET sub_id = NULL, sub_expires_at = NULL, sub_tries_left = 0, sub_tries_total = 0
          WHERE tg_id = $1`,
