@@ -562,31 +562,6 @@ app.post('/api/my-subscription', async (req, res) => {
       return res.json({ success: true, subscription: null, depleted: true });
     }
     
-    // Проверяем не истекла ли подписка
-    const expires = u.sub_expires_at ? new Date(u.sub_expires_at) : null;
-    const now = new Date();
-    const isActive = expires && expires > now;
-    const daysLeft = expires ? Math.max(0, Math.ceil((expires - now) / 86400000)) : 0;
-
-    // Примерки кончились — деактивируем
-    if (isActive && (u.sub_tries_left || 0) <= 0) {
-      await pool.query(
-        `UPDATE users SET sub_id = NULL, sub_expires_at = NULL, sub_tries_left = 0, sub_tries_total = 0
-         WHERE tg_id = $1`,
-        [tgUser.id]
-      );
-      return res.json({ success: true, subscription: null, depleted: true });
-    }
-    
-    if (!isActive && u.sub_id) {
-      await pool.query(
-        `UPDATE users SET sub_id = NULL, sub_expires_at = NULL, sub_tries_left = 0, sub_tries_total = 0
-         WHERE tg_id = $1`,
-        [tgUser.id]
-      );
-      return res.json({ success: true, subscription: null, depleted: true });
-    }
-    
     if (!isActive && u.sub_id) {
       // Подписка истекла — сбрасываем (примерки из неё сгорают)
       await pool.query(
@@ -2172,27 +2147,6 @@ app.post('/api/admin/user-sub/revoke', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
-// Получить подписку конкретного юзера
-app.post('/api/admin/user-sub/get', async (req, res) => {
-  const { initData, tgId } = req.body;
-  const tgUser = verifyTelegramInitData(initData);
-  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
-  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
-  if (!tgId) return res.status(400).json({ error: 'tgId обязателен' });
-  
-  try {
-    const r = await pool.query(
-      `SELECT sub_id, sub_started_at, sub_expires_at, sub_tries_total, sub_tries_left FROM users WHERE tg_id = $1`,
-      [tgId]
-    );
-    res.json({ success: true, sub: r.rows[0] || null });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-  if (!productId) return res.status(400).json({ error: 'productId обязателен' });
 
   try {
     let sql = null;
