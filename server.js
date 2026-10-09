@@ -23,10 +23,10 @@ const MODEL_COSTS = { 'image-apps-v2': 0.04, 'fashn-v1.6': 0.075, 'fashn-v1.5': 
 const STAR_TO_USD = 0.013;
 
 const SUBSCRIPTIONS = {
-  sub_pro:      { title: 'PRО',    stars: 599, oldStars: 999, tries: 50, own: 20, emoji: '💎' },
-  sub_medium:   { title: 'MEDIUM', stars: 299, oldStars: 499, tries: 30, own: 10, emoji: '💥' },
-  sub_start:    { title: 'START',  stars: 65,  oldStars: 119, tries: 10, own: 0,  emoji: '👌' },
-  sub_secret:   { title: 'СЕКРЕТНАЯ', stars: 10, oldStars: 0, tries: 0, own: 2, emoji: '🎁' },
+  sub_pro:      { title: 'PRО',    stars: 599, oldStars: 999, tries: 50, emoji: '💎' },
+  sub_medium:   { title: 'MEDIUM', stars: 299, oldStars: 499, tries: 30, emoji: '💥' },
+  sub_start:    { title: 'START',  stars: 65,  oldStars: 119, tries: 10, emoji: '👌' },
+  sub_secret:   { title: 'СЕКРЕТНАЯ', stars: 10, oldStars: 0, tries: 0,  emoji: '🎁' },
 };
 
 const ACHIEVEMENTS = {
@@ -1153,14 +1153,9 @@ app.post('/api/streak/tick', async (req, res) => {
         if (rr.rows.length) reward = rr.rows[0];
       } catch {}
 
-      if (reward.enabled && (reward.tries > 0 || reward.own_tries > 0)) {
-        if (reward.tries > 0) {
-          await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [reward.tries, tgUser.id]);
-        }
-        if (reward.own_tries > 0) {
-          await pool.query('UPDATE users SET own_tries = own_tries + $1 WHERE tg_id = $2', [reward.own_tries, tgUser.id]);
-        }
-        const msg = reward.text || `🔥 Серия ${newStreakDays} · +${reward.tries + reward.own_tries}`;
+           if (reward.enabled && reward.tries > 0) {
+        await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [reward.tries, tgUser.id]);
+        const msg = reward.text || `🔥 Серия ${newStreakDays} · +${reward.tries}`;
         sendMessage(tgUser.id, `🔥 <b>Серия ${newStreakDays} дней!</b>\n\n${msg}`).catch(() => {});
         rewarded = true;
       }
@@ -1920,7 +1915,6 @@ app.post('/api/webhook/telegram', async (req, res) => {
         await pool.query('INSERT INTO payments (charge_id, tg_id, product, stars) VALUES ($1,$2,$3,$4)', [chargeId, tgId, productType, pay.total_amount]);
         if (productType === 'pack10') await pool.query('UPDATE users SET balance = balance + 10 WHERE tg_id = $1', [tgId]);
         else if (productType === 'custom_tries') await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
-        else if (productType === 'custom_own_tries') await pool.query('UPDATE users SET own_tries = own_tries + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
         else if (productType === 'gift') {}
         else if (productType.startsWith('sub_')) {
   const subId = productType.replace('sub_', '');
