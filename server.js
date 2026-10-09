@@ -537,6 +537,17 @@ app.post('/api/my-subscription', async (req, res) => {
     );
     const u = r.rows[0] || {};
     if (!u.sub_id) return res.json({ success: true, subscription: null });
+
+// После проверки isActive
+if (isActive && (u.sub_tries_left || 0) <= 0) {
+  // Примерки кончились — деактивируем подписку
+  await pool.query(
+    `UPDATE users SET sub_id = NULL, sub_expires_at = NULL, sub_tries_left = 0, sub_tries_total = 0
+     WHERE tg_id = $1`,
+    [tgUser.id]
+  );
+  return res.json({ success: true, subscription: null, depleted: true });
+}
     
     // Проверяем не истекла ли подписка
     const expires = u.sub_expires_at ? new Date(u.sub_expires_at) : null;
