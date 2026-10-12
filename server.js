@@ -2136,6 +2136,24 @@ app.post('/api/admin/products/action', async (req, res) => {
   if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
   if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
 
+  try {
+    let sql = null;
+    let msg = '';
+    switch (action) {
+      case 'pin':     sql = `UPDATE products SET is_pinned = TRUE  WHERE id = $1`; msg = '📌 Закреплено'; break;
+      case 'unpin':   sql = `UPDATE products SET is_pinned = FALSE WHERE id = $1`; msg = '📌 Откреплено'; break;
+      case 'hide':    sql = `UPDATE products SET is_active = FALSE WHERE id = $1`; msg = '🙈 Скрыто'; break;
+      case 'unhide':  sql = `UPDATE products SET is_active = TRUE, is_pinned = FALSE WHERE id = $1`; msg = '👁 Возвращено'; break;
+      case 'delete':  sql = `DELETE FROM products WHERE id = $1`; msg = '🗑 Удалено'; break;
+      default: return res.status(400).json({ error: 'Неизвестное действие' });
+    }
+    await pool.query(sql, [productId]);
+    res.json({ success: true, message: msg });
+  } catch (e) {
+    logError('admin-product-action', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
