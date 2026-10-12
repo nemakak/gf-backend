@@ -2125,43 +2125,6 @@ app.post('/api/admin/products/action', async (req, res) => {
   if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
   if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
 
-  // Выдать подписку юзеру вручную
-app.post('/api/admin/user-sub/grant', async (req, res) => {
-  const { initData, tgId, subId } = req.body;
-  const tgUser = verifyTelegramInitData(initData);
-  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
-  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
-  if (!tgId || !subId) return res.status(400).json({ error: 'tgId и subId обязательны' });
-  
-  try {
-    const sub = await pool.query('SELECT * FROM subscriptions WHERE id = $1', [subId]);
-    if (!sub.rows.length) return res.status(404).json({ error: 'Подписка не найдена' });
-    const s = sub.rows[0];
-    
-    const isSecret = s.duration_days === 0;
-    if (isSecret) {
-      await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [s.tries, tgId]);
-    } else {
-      const expiresAt = new Date(Date.now() + s.duration_days * 86400000);
-      await pool.query(
-        `UPDATE users SET sub_id = $1, sub_started_at = NOW(), sub_expires_at = $2, sub_tries_total = $3, sub_tries_left = $3, sub_active = TRUE WHERE tg_id = $4`,
-        [subId, expiresAt, s.tries, tgId]
-      );
-    }
-    res.json({ success: true });
-  } catch (e) {
-    logError('admin-user-sub-grant', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Забрать подписку у юзера
-app.post('/api/admin/user-sub/revoke', async (req, res) => {
-  const { initData, tgId } = req.body;
-  const tgUser = verifyTelegramInitData(initData);
-  if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
-  if (!(await isAdmin(tgUser.id))) return res.status(403).json({ error: 'Forbidden' });
-  if (!tgId) return res.status(400).json({ error: 'tgId обязателен' });
   
   try {
     await pool.query(
