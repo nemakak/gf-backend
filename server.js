@@ -2012,7 +2012,6 @@ app.post('/api/webhook/telegram', async (req, res) => {
   }
 
   await giveAchievement(tgId, 'first_pay');
-}
       }
     } catch (e) { logError('payment', e.message); }
   }
