@@ -1920,10 +1920,11 @@ app.post('/api/webhook/telegram', async (req, res) => {
       const dup = await pool.query('SELECT 1 FROM payments WHERE charge_id = $1', [chargeId]);
       if (!dup.rows.length) {
         await pool.query('INSERT INTO payments (charge_id, tg_id, product, stars) VALUES ($1,$2,$3,$4)', [chargeId, tgId, productType, pay.total_amount]);
-        if (productType === 'pack10') await pool.query('UPDATE users SET balance = balance + 10 WHERE tg_id = $1', [tgId]);
+                if (productType === 'pack10') await pool.query('UPDATE users SET balance = balance + 10 WHERE tg_id = $1', [tgId]);
         else if (productType === 'custom_tries') await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
+        else if (productType === 'custom_own_tries') await pool.query('UPDATE users SET own_tries = own_tries + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
         else if (productType === 'gift') {}
-        else if (productType.startsWith('sub_')) {
+        else if (productType.startsWith('sub_')) { ... }
   const subId = productType.replace('sub_', '');
   let subData = null;
   try {
