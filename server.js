@@ -790,7 +790,7 @@ app.post('/api/gift/create', async (req, res) => {
   const tgUser = verifyTelegramInitData(initData);
   if (!tgUser) return res.status(401).json({ error: 'Unauthorized' });
   const n = Math.max(1, Math.min(50, Number(tries) || 5));
-  const stars = n * 5;
+  const stars = n * 10;
   const code = 'gift_' + crypto.randomBytes(6).toString('hex');
   try {
     const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/createInvoiceLink`, {
