@@ -1911,52 +1911,69 @@ app.post('/api/webhook/telegram', async (req, res) => {
     if (text === '/privacy') { await sendMessage(update.message.chat.id, `📄 Политика конфиденциальности\n\nСобираем: Telegram ID, имя, @username, фото (не сохраняются).\nПередаём: только fal.ai.\nУдаление: напиши администратору.`); return res.sendStatus(200); }
     return res.sendStatus(200);
   }
-  if (update.message?.successful_payment) {
+    if (update.message?.successful_payment) {
     const pay = update.message.successful_payment;
     const parts = (pay.invoice_payload || '').split(':');
-    const productType = parts[0]; const tgId = Number(parts[1]);
+    const productType = parts[0];
+    const tgId = Number(parts[1]);
     const chargeId = pay.telegram_payment_charge_id;
+
     try {
       const dup = await pool.query('SELECT 1 FROM payments WHERE charge_id = $1', [chargeId]);
+
       if (!dup.rows.length) {
-        await pool.query('INSERT INTO payments (charge_id, tg_id, product, stars) VALUES ($1,$2,$3,$4)', [chargeId, tgId, productType, pay.total_amount]);
-                if (productType === 'pack10') await pool.query('UPDATE users SET balance = balance + 10 WHERE tg_id = $1', [tgId]);
-        else if (productType === 'custom_tries') await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
-        else if (productType === 'custom_own_tries') await pool.query('UPDATE users SET own_tries = own_tries + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
-        else if (productType === 'gift') {}
-        else if (productType.startsWith('sub_')) {
+        await pool.query(
+          'INSERT INTO payments (charge_id, tg_id, product, stars) VALUES ($1,$2,$3,$4)',
+          [chargeId, tgId, productType, pay.total_amount]
+        );
+
+        if (productType === 'pack10') {
+          await pool.query('UPDATE users SET balance = balance + 10 WHERE tg_id = $1', [tgId]);
+        } else if (productType === 'custom_tries') {
+          await pool.query('UPDATE users SET balance = balance + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
+        } else if (productType === 'custom_own_tries') {
+          await pool.query('UPDATE users SET own_tries = own_tries + $1 WHERE tg_id = $2', [Number(parts[2]) || 1, tgId]);
+        } else if (productType === 'gift') {
+          // ничего — активация через /api/gift/claim
+        } else if (productType.startsWith('sub_')) {
           const subId = productType.replace('sub_', '');
           let subData = null;
           try {
             const r = await pool.query('SELECT * FROM subscriptions WHERE id = $1', [subId]);
             subData = r.rows[0];
-          } catch {}
+          } catch (e) {}
 
           if (subData) {
             const isSecret = subData.duration_days === 0;
 
             if (isSecret) {
               const checkRow = await pool.query('SELECT secret_bought FROM users WHERE tg_id = $1', [tgId]);
-              if (checkRow.rows[0]?.secret_bought) {
+              if (checkRow.rows[0] && checkRow.rows[0].secret_bought) {
                 console.log('[payment] secret already bought by', tgId);
-                return;
+              } else {
+                await pool.query(
+                  'UPDATE users SET balance = balance + $1, secret_bought = TRUE WHERE tg_id = $2',
+                  [subData.tries, tgId]
+                );
+                sendMessage(tgId, `🎁 <b>+${subData.tries} примерки!</b>\n\nНачислены на баланс`).catch(() => {});
               }
-              await pool.query('UPDATE users SET balance = balance + $1, secret_bought = TRUE WHERE tg_id = $2', [subData.tries, tgId]);
-              sendMessage(tgId, `🎁 <b>+${subData.tries} примерки!</b>\n\nНачислены на баланс`).catch(() => {});
             } else {
               const expiresAt = new Date(Date.now() + subData.duration_days * 86400000);
               await pool.query(
-                `UPDATE users SET 
-                  sub_id = $1,
-                  sub_started_at = NOW(),
-                  sub_expires_at = $2,
-                  sub_tries_total = $3,
-                  sub_tries_left = $3,
-                  sub_active = TRUE
+                `UPDATE users SET
+                   sub_id = $1,
+                   sub_started_at = NOW(),
+                   sub_expires_at = $2,
+                   sub_tries_total = $3,
+                   sub_tries_left = $3,
+                   sub_active = TRUE
                  WHERE tg_id = $4`,
                 [subId, expiresAt, subData.tries, tgId]
               );
-              sendMessage(tgId, `✨ <b>Подписка активирована!</b>\n\n${subData.emoji} ${subData.name}\n${subData.tries} примерок\nДействует до ${expiresAt.toLocaleDateString('ru-RU')}`).catch(() => {});
+              sendMessage(
+                tgId,
+                `✨ <b>Подписка активирована!</b>\n\n${subData.emoji} ${subData.name}\n${subData.tries} примерок\nДействует до ${expiresAt.toLocaleDateString('ru-RU')}`
+              ).catch(() => {});
             }
           } else {
             console.error('[payment sub] not found for', productType, 'and', subId);
@@ -1965,56 +1982,12 @@ app.post('/api/webhook/telegram', async (req, res) => {
 
           await giveAchievement(tgId, 'first_pay');
         }
-  let subData = null;
-  try {
-    const r = await pool.query('SELECT * FROM subscriptions WHERE id = $1', [subId]);
-    subData = r.rows[0];
-  } catch {}
-
-  if (subData) {
-    const isSecret = subData.duration_days === 0;
-    const u = await pool.query('SELECT sub_id, sub_expires_at, sub_tries_total, sub_tries_left FROM users WHERE tg_id = $1', [tgId]);
-    const user = u.rows[0] || {};
-    const hasActive = user.sub_id && user.sub_expires_at && new Date(user.sub_expires_at) > new Date();
-    const isSameSub = hasActive && user.sub_id === subId;
-
-        if (isSecret) {
-      // Проверяем, покупал ли уже
-      const checkRow = await pool.query('SELECT secret_bought FROM users WHERE tg_id = $1', [tgId]);
-      if (checkRow.rows[0]?.secret_bought) {
-        // Уже покупал — не начисляем повторно
-        console.log('[payment] secret already bought by', tgId);
-        return;
       }
-      // СЕКРЕТНАЯ — просто +примерки, помечаем как купленную
-      await pool.query('UPDATE users SET balance = balance + $1, secret_bought = TRUE WHERE tg_id = $2', [subData.tries, tgId]);
-      sendMessage(tgId, `🎁 <b>+${subData.tries} примерки!</b>\n\nНачислены на баланс`).catch(() => {});
+    } catch (e) {
+      logError('payment', e.message);
     }
-      // ПЕРЕХОД — примерки сгорают
-      const expiresAt = new Date(Date.now() + subData.duration_days * 86400000);
-      await pool.query(
-        `UPDATE users SET 
-          sub_id = $1,
-          sub_started_at = NOW(),
-          sub_expires_at = $2,
-          sub_tries_total = $3,
-          sub_tries_left = $3,
-          sub_active = TRUE
-         WHERE tg_id = $4`,
-        [subId, expiresAt, subData.tries, tgId]
-      );
-      sendMessage(tgId, `✨ <b>Подписка активирована!</b>\n\n${subData.emoji} ${subData.name}\n${subData.tries} примерок\nДействует до ${expiresAt.toLocaleDateString('ru-RU')}`).catch(() => {});
-    }
-  } else {
-        // Подписка не найдена в БД
-    console.error('[payment sub] not found for', productType, 'and', subId);
-    sendMessage(tgId, `⚠️ Подписка не найдена. Обратитесь в поддержку.`).catch(() => {});
   }
 
-  await giveAchievement(tgId, 'first_pay');
-      }
-    } catch (e) { logError('payment', e.message); }
-  }
   res.sendStatus(200);
 });
 // ============================================================
