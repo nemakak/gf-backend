@@ -300,7 +300,7 @@ app.post('/api/auth', async (req, res) => {
           if (inv.rows.length) inviterId = parsed;
         }
       }
-      const initialBalance = startBalance + dailyBonusTries;
+      const initialBalance = startBalance;
       const ins = await pool.query(
         `INSERT INTO users (tg_id, username, first_name, photo_url, balance, own_tries, sub_active, ref_by, last_active, streak_days, last_streak_date, last_daily_bonus)
          VALUES ($1,$2,$3,$4,$5,0,FALSE,$6,NOW(),1,CURRENT_DATE,CURRENT_DATE) RETURNING *`,
